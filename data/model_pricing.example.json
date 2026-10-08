@@ -1,0 +1,11 @@
+{
+  "version": "replace-with-provider-price-date",
+  "currency": "USD",
+  "models": {
+    "deepseek-chat": {
+      "prompt_per_million": 0.0,
+      "completion_per_million": 0.0
+    }
+  },
+  "note": "这是格式示例，0.0 不是实际报价。运行实验前请按供应商当日公开价格替换，并将该文件随报告归档。"
+}

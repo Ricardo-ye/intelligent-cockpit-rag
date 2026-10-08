@@ -1,0 +1,26 @@
+name: Bug report
+description: 报告可复现的问题或回归
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: textarea
+    attributes:
+      label: 问题描述
+      description: 实际发生了什么？期望行为是什么？
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: 复现步骤
+      description: 请提供最小可复现步骤，并隐去 API Key、个人数据和私有语料。
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Python 与操作系统版本
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: 日志或报告
+      description: 请粘贴已脱敏的错误信息、配置和相关日志。

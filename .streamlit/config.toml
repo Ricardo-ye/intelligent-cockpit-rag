@@ -1,0 +1,8 @@
+# 由工作台自动维护：让 Streamlit 原生控件跟随界面主题
+[theme]
+base = "dark"
+primaryColor = "#3b82f6"
+backgroundColor = "#0d0f14"
+secondaryBackgroundColor = "#161a23"
+textColor = "#e9eef7"
+font = "sans serif"
