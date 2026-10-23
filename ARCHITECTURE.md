@@ -78,6 +78,7 @@
 - 缓存：`load/save_cached_vectors` 以 **`corpus_hash + config.signature()`** 为键落盘 `.npy`，
   并校验形状。**参数一改，缓存自动失效**——从机制上杜绝"改了 chunk_size 却复用旧向量"的静默错误。
 - `build_index()`：统一构建入口，串起「向量化 → 向量索引 → BM25」，产出 `RetrievalIndex`。
+- **标题增强**：向量化与 BM25 使用“文档标题 + 分块正文”建索引；展示、引用与生成仍使用原始正文，避免切到段落中部后丢失主题。
 
 ### 2.5 `retrieve.py` —— 检索与重排
 - `Retriever.retrieve()` 三条路径：
@@ -90,6 +91,8 @@
   - `bm25`：对候选用 BM25 重新打分（离线、零成本）；
   - `llm`：把候选编号后交给真实 LLM 打 0-10 相关性分，JSON 解析失败即报错（不猜、不兜造）。
 - `RetrieveStats`：真实记录向量/BM25/融合/重排各阶段耗时与候选规模。
+- **防答非所问门控**：融合分只用于同批候选排序，不能代表跨问题置信度。重排后会再按当前检索词的中文二元组/英文词覆盖率过滤（默认 `min_query_coverage=0.12`）；无候选时进入“资料不足，无法回答”。
+- **上下文多样性**：默认每篇文档最多保留 2 个块（`max_chunks_per_doc`），避免一篇聚合网页占满整个上下文窗口。
 
 ### 2.6 `generate.py` —— 答案生成与上下文压缩
 - `AnswerGenerator`：
@@ -97,6 +100,8 @@
   - `extractive`：离线抽取式——在召回原文中按「句 × 问题」词法相关度排序，取真实原句拼成答案。
 - `ContextCompressor`：有 LLM 时用 LLM 抽句，否则用词法阈值筛句；压缩后**复制 Chunk**，不污染原始索引。
 - `_build_context()`：受 `max_context_chars` 约束拼装上下文，并回传实际用到的 `chunk_id`（可追溯）。
+- 上下文块带有来源标题；离线抽取式答案要求最小句级相关度，避免只因共享一个字/词就拼入答案。
+- 多轮改写只在存在明确指代（如“那后排呢”“它有什么要求”）时触发；短但自足的新问题不会继承上一轮主题。历史按轮数与字符预算双重裁剪。
 - **压缩与生成分别计时**：`GeneratedAnswer.compress_s` 单独记录上下文压缩耗时，
   避免把压缩的 LLM 调用算进 `latency_s` 而虚高「平均生成耗时」（启用压缩时 CLI 会额外提示该口径）。
 - 生成失败**不降级为编造**，而是返回带 `error` 的空答案，由上层如实记录。
@@ -402,3 +407,4 @@ tokens `prompt=30224 / completion=6746 / total=36970`；LLM 累计 114.7s，判�
 | 新增指标 | `metrics.py` + `evaluate._run_one` | 实现函数并 `_put(name, value, family, method, detail)` 注册 |
 | 换成 RAGAS | `metrics` 旁挂 adapter | 保持 `MetricValue(name, value, family, method, detail)` 契约即可无缝替换 |
 | 参数自动寻优 | `run_eval_cli.py --sweep` | 已支持单参数扫描；多参数可在此基础上升级为网格/贝叶斯搜索 |
+
