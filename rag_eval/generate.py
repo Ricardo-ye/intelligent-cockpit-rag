@@ -38,7 +38,7 @@ CHAT_SYSTEM_PROMPT = (
 # ─────────────────────────────────────────────
 # 多轮追问：把指代型问题改写成可独立检索的查询
 # ─────────────────────────────────────────────
-FOLLOWUP_STARTERS = ("那", "那么", "还有", "这个", "那个", "再", "继续", "它", "他", "其", "呢")
+FOLLOWUP_STARTERS = ("那", "那么", "还有", "这个", "那个", "再", "继续", "它", "他", "其", "上面", "刚才", "前面")
 FOLLOWUP_PRONOUNS = ("它", "他", "这个", "那个", "这些", "那些", "其", "该", "上面", "刚才", "前面")
 REWRITE_MAX_CHARS = 120
 
@@ -53,14 +53,14 @@ def _last_user_text(history: Optional[Sequence[dict]]) -> str:
 def looks_like_followup(question: str, history: Optional[Sequence[dict]]) -> bool:
     """判断一个问题是否是「依赖上文的追问」。
 
-    短问题、以「那/还有/再」开头、或含明显指代词 → 视为追问。
-    只是启发式判断，判错了也不会有害：最坏情况是把上一轮问题拼进检索词。
+    以「那/还有/再」开头或含明显指代词 → 视为追问。
+
+    不能仅因问题短而判为追问：例如「座椅加热有哪几种开启方式？」虽然短，
+    却是自足的新主题；若把上一轮 ACC 问题拼进去，会直接把检索带偏。
     """
     q = (question or "").strip()
     if not q or not history:
         return False
-    if len(q) <= 14:
-        return True
     if any(q.startswith(s) for s in FOLLOWUP_STARTERS):
         return True
     return any(p in q for p in FOLLOWUP_PRONOUNS)
@@ -208,17 +208,19 @@ class AnswerGenerator:
 
     def generate(self, question: str, contexts: List[RetrievedChunk],
                  history: Optional[Sequence[dict]] = None,
-                 max_history_turns: int = 3) -> GeneratedAnswer:
+                  max_history_turns: int = 3,
+                  retrieval_query: Optional[str] = None) -> GeneratedAnswer:
         """生成答案。
 
         ``history`` 仅在多轮对话场景传入（``[{role:'user'|'assistant', content:str}, ...]``，旧→新）。
         评测链路不传 history，因此提示词与历史指标口径完全不变。
         """
-        turns = self._trim_history(history, max_history_turns)
+        turns = self._trim_history(history, max_history_turns, self.cfg.max_history_chars)
+        retrieval_query = (retrieval_query or build_retrieval_query(question, turns, self.llm)[0]).strip()
         compress_s = 0.0
         if self.cfg.use_compression:
             t_c = time.perf_counter()
-            contexts = self.compressor.compress(question, contexts)
+            contexts = self.compressor.compress(retrieval_query, contexts)
             compress_s = time.perf_counter() - t_c
 
         ctx_block, used_ids, used_contexts = self._build_context(contexts)
@@ -229,6 +231,7 @@ class AnswerGenerator:
                 vector_score=rc.vector_score,
                 bm25_score=rc.bm25_score,
                 rerank_score=rc.rerank_score,
+                query_coverage=rc.query_coverage,
                 rank=rc.rank,
                 source=rc.source,
             )
@@ -248,7 +251,7 @@ class AnswerGenerator:
                 )
         else:
             answer = self._extractive_answer(
-                build_retrieval_query(question, turns)[0], effective_contexts
+                retrieval_query, effective_contexts
             )
 
         return GeneratedAnswer(
@@ -261,28 +264,38 @@ class AnswerGenerator:
             context_chars=len(ctx_block),
             compress_s=compress_s,
             history_turns=len(turns) // 2,
+            rewritten_query=retrieval_query if retrieval_query != question else None,
         )
 
     @staticmethod
-    def _trim_history(history: Optional[Sequence[dict]], max_turns: int) -> List[dict]:
+    def _trim_history(history: Optional[Sequence[dict]], max_turns: int,
+                      max_chars: Optional[int] = None) -> List[dict]:
         """只保留最近 max_turns 轮（一轮 = 一问一答），并按 user/assistant 交替截断。
 
         截断必须从「user」开始，否则会出现「历史第一条是助手回答」这种残缺上下文。
         """
         if not history:
             return []
-        msgs = [m for m in history if (m or {}).get("content")]
+        msgs = [m for m in history if (m or {}).get("content") and m.get("role") in ("user", "assistant")]
         if max_turns > 0:
             msgs = msgs[-max_turns * 2:]
         while msgs and msgs[0].get("role") != "user":
             msgs.pop(0)
+        # 优先成对剔除最早轮次，不把孤立的助手回答留在历史开头。这样历史再长也
+        # 不会挤掉本轮资料与问题；最后一轮仍保留，供指代消解使用。
+        if max_chars:
+            while len(msgs) > 2 and sum(len(str(m.get("content", ""))) for m in msgs) > max_chars:
+                del msgs[:2]
+            if len(msgs) <= 2 and sum(len(str(m.get("content", ""))) for m in msgs) > max_chars:
+                budget = max(64, max_chars // len(msgs))
+                msgs = [{**m, "content": str(m.get("content", ""))[:budget]} for m in msgs]
         return msgs
 
     # ── 上下文拼装（受 max_context_chars 约束）──
     def _build_context(self, contexts: List[RetrievedChunk]) -> tuple:
         parts, used, actual, total = [], [], [], 0
         for i, rc in enumerate(contexts, 1):
-            prefix = f"[{i}] "
+            prefix = f"[{i}] 来源：{rc.chunk.doc_title}\n"
             separator_chars = 2 if parts else 0
             remaining = self.cfg.max_context_chars - total - separator_chars
             if remaining <= len(prefix):
@@ -332,7 +345,7 @@ class AnswerGenerator:
         scored.sort(key=lambda x: -x[0])
         picked, seen = [], set()
         for score, s in scored:
-            if score <= 0.0 or s in seen:
+            if score < 0.08 or s in seen:
                 continue
             picked.append(s)
             seen.add(s)
@@ -354,3 +367,4 @@ __all__ = [
     "RAG_SYSTEM_PROMPT", "CHAT_SYSTEM_PROMPT",
     "build_retrieval_query", "looks_like_followup",
 ]
+
