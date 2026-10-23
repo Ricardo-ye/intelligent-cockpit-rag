@@ -14,7 +14,7 @@ from .config import RunConfig
 from .index import RetrievalIndex
 from .ingest import Chunk
 from .llm import LLMClient, LLMError
-from .textutils import minmax_normalize, truncate
+from .textutils import minmax_normalize, query_coverage, truncate
 
 
 @dataclass
@@ -24,6 +24,7 @@ class RetrievedChunk:
     vector_score: Optional[float] = None
     bm25_score: Optional[float] = None
     rerank_score: Optional[float] = None
+    query_coverage: Optional[float] = None
     rank: int = 0
     source: str = "vector"
 
@@ -38,6 +39,7 @@ class RetrievedChunk:
             "vector_score": None if self.vector_score is None else round(self.vector_score, 6),
             "bm25_score": None if self.bm25_score is None else round(self.bm25_score, 6),
             "rerank_score": None if self.rerank_score is None else round(self.rerank_score, 6),
+            "query_coverage": None if self.query_coverage is None else round(self.query_coverage, 6),
             "source": self.source,
             "text": self.chunk.text,
         }
@@ -53,6 +55,7 @@ class RetrieveStats:
     rerank_latency_s: float = 0.0
     candidates: int = 0
     final: int = 0
+    filtered_low_support: int = 0
     rerank_backend: str = "none"
 
 
@@ -131,12 +134,15 @@ class Retriever:
     def retrieve(self, query: str, top_k: Optional[int] = None) -> List[RetrievedChunk]:
         k = top_k or self.cfg.top_k
         stats = RetrieveStats(rerank_backend=self.cfg.rerank_backend)
+        # 重排必须看到比最终 Top-K 更大的候选池；否则只是给已经截断的结果换序，
+        # 无法把排在第 k+1 位的正确块救回来。
+        candidate_k = max(k * 4, 20) if self.cfg.rerank_backend != "none" else k
 
         vec_pairs: List[tuple] = []
         bm25_pairs: List[tuple] = []
 
         if self.cfg.use_hybrid:
-            pool = max(k * 4, 20)
+            pool = max(candidate_k, k * 4, 20)
             t = time.perf_counter()
             vec_pairs = self.index.vector_search(query, pool)
             stats.vector_latency_s = round(time.perf_counter() - t, 3)
@@ -145,11 +151,11 @@ class Retriever:
             stats.bm25_latency_s = round(time.perf_counter() - t, 3)
         else:
             t = time.perf_counter()
-            vec_pairs = self.index.vector_search(query, k)
+            vec_pairs = self.index.vector_search(query, candidate_k)
             stats.vector_latency_s = round(time.perf_counter() - t, 3)
 
         t = time.perf_counter()
-        cands = self._fuse(vec_pairs, bm25_pairs, k)
+        cands = self._fuse(vec_pairs, bm25_pairs, candidate_k)
         stats.fusion_latency_s = round(time.perf_counter() - t, 3)
         stats.candidates = len(vec_pairs) + len(bm25_pairs)
 
@@ -161,11 +167,46 @@ class Retriever:
         else:
             cands = cands[:k]
 
+        # 融合分数只用于排序，不能被解释为“答案置信度”。这里使用当前检索词的
+        # 词面覆盖作独立门控：没有任何足够主题信号的候选不进入生成上下文。
+        cands, dropped = self._filter_low_support(query, cands)
+        stats.filtered_low_support = dropped
+        cands = self._limit_per_document(cands, k)
+
         for i, c in enumerate(cands, 1):
             c.rank = i
         stats.final = len(cands)
         self.last_stats = stats
         return cands
+
+    def _filter_low_support(self, query: str, cands: List[RetrievedChunk]) -> tuple[List[RetrievedChunk], int]:
+        threshold = float(self.cfg.min_query_coverage)
+        if threshold <= 0:
+            for c in cands:
+                c.query_coverage = query_coverage(query, f"{c.chunk.doc_title}\n{c.chunk.text}")
+            return cands, 0
+
+        kept: List[RetrievedChunk] = []
+        for c in cands:
+            coverage = query_coverage(query, f"{c.chunk.doc_title}\n{c.chunk.text}")
+            c.query_coverage = coverage
+            if coverage >= threshold:
+                kept.append(c)
+        return kept, len(cands) - len(kept)
+
+    def _limit_per_document(self, cands: List[RetrievedChunk], k: int) -> List[RetrievedChunk]:
+        """保留排序的同时限制单篇文档占位，给不同来源留下互证空间。"""
+        seen: Dict[str, int] = {}
+        out: List[RetrievedChunk] = []
+        for c in cands:
+            n = seen.get(c.chunk.doc_id, 0)
+            if n >= self.cfg.max_chunks_per_doc:
+                continue
+            seen[c.chunk.doc_id] = n + 1
+            out.append(c)
+            if len(out) >= k:
+                break
+        return out
 
     def _fuse(self, vec_pairs, bm25_pairs, k: int) -> List[RetrievedChunk]:
         """分数融合。仅向量/仅 BM25/混合三种路径。"""
@@ -203,3 +244,4 @@ class Retriever:
 
 
 __all__ = ["Retriever", "Reranker", "RetrievedChunk", "RetrieveStats"]
+
