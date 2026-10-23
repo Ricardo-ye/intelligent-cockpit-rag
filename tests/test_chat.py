@@ -46,16 +46,49 @@ def test_generation_context_respects_budget() -> None:
 
 def test_followup_detection() -> None:
     h = _history()
-    # 追问：短问题 / 以「那」开头 / 含指代词
+    # 追问：以「那」开头或含明确指代词
     assert looks_like_followup("那后排呢？", h) is True
     assert looks_like_followup("它有什么要求？", h) is True
     assert looks_like_followup("还有别的吗", h) is True
-    # 独立问题：够长且无指代
+    # 独立问题：无论长短，只要没有指代都不应污染检索词
     assert looks_like_followup("智能座舱的语音助手支持哪些方言识别？", h) is False
+    assert looks_like_followup("座椅加热有哪几种开启方式？", h) is False
     # 没有历史时一律不算追问（首轮问题不该被改写）
     assert looks_like_followup("那后排呢？", []) is False
     assert looks_like_followup("那后排呢？", None) is False
-    print("  ✔ 追问识别：短问题/指代词判为追问，独立问题与首轮不改写")
+    print("  ✔ 追问识别：明确指代才改写，独立问题与首轮不改写")
+
+
+def test_independent_short_question_does_not_inherit_previous_topic() -> None:
+    """截图同类回归：上一轮 ACC 不得污染下一轮独立的座椅加热问题。"""
+    cfg = RunConfig(llm_backend="offline", top_k=5, use_hybrid=True)
+    ev = Evaluator(cfg)
+    ev.prepare(load_documents_from(builtin=True))
+    history = [
+        {"role": "user", "content": "ACC 自适应巡航应该怎么开启？"},
+        {"role": "assistant", "content": "通过方向盘按键开启并设定速度。"},
+    ]
+    q = "座椅加热有哪几种开启方式？"
+    search_q, rewritten = build_retrieval_query(q, history, llm=None)
+    assert rewritten is False and search_q == q, f"独立短问题不应拼接上轮主题：{search_q}"
+    retrieved = ev.retriever.retrieve(search_q)
+    assert retrieved and retrieved[0].chunk.doc_id == "doc-seat", [r.to_dict() for r in retrieved]
+    answer = ev.generator.generate(q, retrieved, history=history, retrieval_query=search_q)
+    assert "三种" in answer.answer and "中央显示屏" in answer.answer, answer.to_dict()
+    assert "ACC" not in answer.answer, answer.to_dict()
+    print("  ✔ 独立短问题：未继承 ACC 主题，首条召回座椅文档并返回三种开启方式")
+
+
+def test_no_support_abstains_instead_of_forcing_an_answer() -> None:
+    """无关问题不应因“总有 Top-K”而从任意车辆知识中拼一个答案。"""
+    ev = Evaluator(RunConfig(llm_backend="offline"))
+    ev.prepare(load_documents_from(builtin=True))
+    q = "火星基地种植番茄的光照方案是什么？"
+    retrieved = ev.retriever.retrieve(q)
+    assert retrieved == [], f"无关问题应被支撑门控拦下，实际：{[r.to_dict() for r in retrieved]}"
+    answer = ev.generator.generate(q, retrieved)
+    assert answer.answer == "资料不足，无法回答。", answer.to_dict()
+    print("  ✔ 无关问题：未强行返回车辆知识，正确拒答")
 
 
 def test_query_rewrite_offline() -> None:
@@ -155,6 +188,8 @@ def test_eval_path_unaffected_by_history() -> None:
 TESTS = [
     ("生成上下文预算", test_generation_context_respects_budget),
     ("追问识别", test_followup_detection),
+    ("独立短问题不串题", test_independent_short_question_does_not_inherit_previous_topic),
+    ("无关问题拒答", test_no_support_abstains_instead_of_forcing_an_answer),
     ("查询改写（离线兜底）", test_query_rewrite_offline),
     ("历史截断", test_history_trimming),
     ("真实两轮问答", test_real_two_turn_conversation),
@@ -182,3 +217,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
