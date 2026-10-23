@@ -27,7 +27,7 @@ class IndexError_(RuntimeError):
     """索引构建/检索失败。"""
 
 
-CACHE_SCHEMA_VERSION = "v2"
+CACHE_SCHEMA_VERSION = "v3"
 
 
 # ─────────────────────────────────────────────
@@ -237,7 +237,10 @@ def build_index(
     emb = embedder or Embedder(cfg)
     # 无论是否命中缓存，本地后端都需先拟合词表，以便编码查询。
     # 这也让我们能校验缓存的实际维度，防止算法升级后读到旧向量。
-    emb.fit([c.text for c in chunks])
+    # 标题是稳定的主题标签。把它纳入索引表示可避免正文切到中段后丢失“这段在讲什么”。
+    # Chunk.text 仍保持原文，供引用与生成使用。
+    index_texts = [f"{c.doc_title}\n{c.text}" for c in chunks]
+    emb.fit(index_texts)
     expected_dim = emb.dim if cfg.embed_backend == "local-tfidf-svd" else None
     cached = load_cached_vectors(cfg, digest, len(chunks), expected_dim=expected_dim)
     if cached is not None:
@@ -247,7 +250,7 @@ def build_index(
     else:
         cache_hit = False
         _p(f"向量化中：{emb.describe()['name']}，共 {len(chunks)} 个分块")
-        vectors = emb.encode([c.text for c in chunks])
+        vectors = emb.encode(index_texts)
         save_cached_vectors(cfg, digest, vectors)
     stats["embed_latency_s"] = round(time.perf_counter() - t0, 3)
     stats["embed_backend"] = emb.describe()["name"]
@@ -264,7 +267,7 @@ def build_index(
     bm25 = None
     if cfg.use_hybrid or cfg.rerank_backend == "bm25":
         t2 = time.perf_counter()
-        bm25 = BM25Index().build([c.text for c in chunks])
+        bm25 = BM25Index().build(index_texts)
         stats["bm25_latency_s"] = round(time.perf_counter() - t2, 3)
         _p(f"BM25 索引就绪（{len(chunks)} 条）")
     stats["index_total_latency_s"] = round(stats["embed_latency_s"] + stats["vector_index_latency_s"], 3)
@@ -280,3 +283,4 @@ __all__ = [
     "VectorIndex", "BM25Index", "RetrievalIndex", "IndexError_",
     "build_index", "cache_key", "load_cached_vectors", "save_cached_vectors",
 ]
+
