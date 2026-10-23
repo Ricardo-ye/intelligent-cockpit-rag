@@ -157,6 +157,10 @@ class RunConfig:
     top_k: int = 5
     use_hybrid: bool = True
     bm25_weight: float = 0.4                 # 混合检索中 BM25 的权重（0~1）
+    # 候选必须覆盖的最小问题关键信号比例。0 表示关闭；用于阻断“总会返回 Top-K”
+    # 导致的答非所问，而不是把 min-max 融合分（跨查询不可比）误作置信度。
+    min_query_coverage: float = 0.12
+    max_chunks_per_doc: int = 2              # 防止单篇长网页占满上下文窗口
 
     # —— 重排 ——
     rerank_backend: str = "none"             # none | llm | bm25
@@ -174,6 +178,7 @@ class RunConfig:
     llm_max_tokens: int = DEFAULT_MAX_TOKENS
     llm_max_attempts: int = 3              # 含首次尝试；仅对暂时性错误重试
     llm_retry_base_delay: float = 1.0      # 指数退避基数（秒）
+    max_history_chars: int = 2400          # 多轮历史的字符预算，避免旧回答淹没本轮问题
 
     # —— 评判（LLM 判官指标）——
     use_llm_judge: bool = False              # 需 LLM 可用；faithfulness / answer_relevancy 走 LLM
@@ -202,6 +207,10 @@ class RunConfig:
             raise ValueError("top_k 与 rerank_top_k 必须大于 0。")
         if not 0.0 <= self.bm25_weight <= 1.0:
             raise ValueError("bm25_weight 必须位于 [0, 1]。")
+        if not 0.0 <= self.min_query_coverage <= 1.0:
+            raise ValueError("min_query_coverage 必须位于 [0, 1]。")
+        if self.max_chunks_per_doc <= 0:
+            raise ValueError("max_chunks_per_doc 必须大于 0。")
         if self.rerank_backend not in RERANK_BACKENDS:
             raise ValueError(f"未知重排后端：{self.rerank_backend}")
         if self.max_context_chars <= 0:
@@ -214,6 +223,8 @@ class RunConfig:
             raise ValueError("llm_max_tokens 与 llm_max_attempts 必须大于 0。")
         if self.llm_retry_base_delay < 0:
             raise ValueError("llm_retry_base_delay 不能为负数。")
+        if self.max_history_chars <= 0:
+            raise ValueError("max_history_chars 必须大于 0。")
         if self.judge_request_timeout <= 0:
             raise ValueError("judge_request_timeout 必须大于 0。")
 
@@ -310,3 +321,4 @@ __all__ = [
     "REASONING_MODEL_HINTS", "is_reasoning_model", "recommended_max_tokens",
     "RunConfig", "capability_report", "load_dotenv",
 ]
+
