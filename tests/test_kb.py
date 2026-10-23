@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from rag_eval.ingest import load_json_corpus  # noqa: E402
-from rag_eval.kb import KBError, MAX_DOC_CHARS, KnowledgeBase  # noqa: E402
+from rag_eval.kb import KBError, MAX_DOC_CHARS, KnowledgeBase, assess_document_quality  # noqa: E402
 
 
 def _kb() -> tuple:
@@ -205,6 +205,25 @@ def test_blank_input_rejected() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_quality_audit_and_safe_cleaning() -> None:
+    """网页页脚残留应被清洗/提示，但审计不应擅自删除用户文档。"""
+    kb, tmp = _kb()
+    try:
+        noisy = "ACC 可通过方向盘按键开启。\n内容合作\n责任编辑：测试\nACC 可通过方向盘按键开启。"
+        result = kb.add_text("ACC 操作", noisy, source="网页")
+        assert result.added == 1
+        saved = kb.documents()[0].text
+        assert "内容合作" not in saved and saved.count("ACC 可通过") == 1, saved
+        q = assess_document_quality(noisy)
+        assert q["warnings"], q
+        audit = kb.audit_quality(include_clean=True)
+        assert len(audit) == 1 and audit[0]["doc_id"] == kb.entries()[0]["doc_id"], audit
+        assert kb.stats()["n_docs"] == 1, "质量审计只能报告，不能自动删除资料"
+        print("  ✔ 资料质量：清洗确定性页脚/重复行，审计仅提示不删除")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 TESTS = [
     ("文本导入·去重·覆盖更新", test_text_import_dedupe_and_update),
     ("跨来源内容去重", test_content_dedupe_across_sources),
@@ -215,6 +234,7 @@ TESTS = [
     ("删除/清空/导出", test_remove_clear_and_export),
     ("超长正文截断", test_oversize_text_is_truncated),
     ("空输入拒绝", test_blank_input_rejected),
+    ("资料质量清洗与审计", test_quality_audit_and_safe_cleaning),
 ]
 
 
@@ -238,3 +258,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
