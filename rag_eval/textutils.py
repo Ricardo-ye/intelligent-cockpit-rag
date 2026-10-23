@@ -37,6 +37,7 @@ def _ensure_jieba() -> bool:
 
 
 _TOKEN_RE = re.compile(r"[a-zA-Z]+|\d+")
+_QUERY_NOISE = set("的了和是在有把被向与及或而但并从为以之其该等什么怎么怎样如何哪些哪个吗呢啊请问一下")
 
 
 def tokenize(text: str, drop_stopwords: bool = True) -> List[str]:
@@ -119,6 +120,25 @@ def overlap_ratio(a: str, b: str) -> float:
     return common / sum(a_tokens.values())
 
 
+def query_coverage(query: str, text: str) -> float:
+    """计算正文对问题关键信号的覆盖率（0~1）。
+
+    混合检索的 min-max 分数只反映同一批候选的相对名次：即使所有候选都无关，
+    第一名也可能是 1。因此这里独立使用中文二元组及英文/数字词做“能否支撑问题”
+    的下限门控。疑问词、助词不会计入分母，避免“什么/怎么”制造伪相关。
+    """
+    q = (query or "").lower()
+    body = (text or "").lower()
+    latin = {t for t in _TOKEN_RE.findall(q) if len(t) > 1}
+    cjk = "".join(ch for ch in q if "\u4e00" <= ch <= "\u9fff" and ch not in _QUERY_NOISE)
+    signals = set(latin)
+    signals.update(cjk[i:i + 2] for i in range(len(cjk) - 1))
+    if not signals:
+        return 1.0
+    matched = sum(1 for signal in signals if signal in body)
+    return matched / len(signals)
+
+
 def lcs_length(a: Sequence[str], b: Sequence[str]) -> int:
     """最长公共子序列长度（用于 ROUGE-L）。"""
     if not a or not b:
@@ -171,6 +191,7 @@ def truncate(text: str, max_chars: int) -> str:
 
 
 __all__ = [
-    "tokenize", "char_ngrams", "split_sentences", "token_f1", "overlap_ratio",
+    "tokenize", "char_ngrams", "split_sentences", "token_f1", "overlap_ratio", "query_coverage",
     "lcs_length", "rouge_l", "cosine", "minmax_normalize", "truncate",
 ]
+
