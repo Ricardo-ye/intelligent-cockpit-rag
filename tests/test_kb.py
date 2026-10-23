@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from rag_eval.ingest import load_json_corpus  # noqa: E402
-from rag_eval.kb import KBError, MAX_DOC_CHARS, KnowledgeBase  # noqa: E402
+from rag_eval.kb import KBError, MAX_DOC_CHARS, KnowledgeBase, assess_document_quality  # noqa: E402
 
 
 def _kb() -> tuple:
@@ -58,6 +58,29 @@ def test_content_dedupe_across_sources() -> None:
         assert r.skipped == 1 and r.added == 0, r.summary()
         assert kb.stats()["n_docs"] == 1
         print("  ✔ 跨来源内容去重：同一正文只入库一次")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_vehicle_scope_filters_legacy_and_cross_model_documents() -> None:
+    """指定车型后，只能召回通用资料与同品牌/车型/年款资料。"""
+    kb, tmp = _kb()
+    try:
+        kb.add_text("通用答复规范", "未绑定车型时不得编造具体按钮位置。", source="治理", metadata={"scope": "generic"})
+        kb.add_text("Tesla Model 3 座椅", "Model 3 的座椅功能请以对应用户手册为准。", source="手册T",
+                    metadata={"scope": "specific", "brand": "Tesla", "model": "Model 3", "year": "2024"})
+        kb.add_text("奔驰座椅", "奔驰车型的座椅设置请以该车手册为准。", source="手册B",
+                    metadata={"scope": "specific", "brand": "Mercedes", "model": "C-Class", "year": "2024"})
+        kb.add_text("旧网页", "旧资料没有车型元数据，不能用于指定车型的操作答案。", source="旧网页")
+
+        scoped = kb.documents({"brand": "Tesla", "model": "Model 3", "year": "2024"})
+        assert {d.title for d in scoped} == {"通用答复规范", "Tesla Model 3 座椅"}
+        assert all(d.metadata.get("brand") != "Mercedes" for d in scoped)
+
+        # 内容未变但修正元数据时必须更新持久化，而不能被内容去重静默吞掉。
+        updated = kb.add_text("旧网页", "旧资料没有车型元数据，不能用于指定车型的操作答案。", source="旧网页",
+                              metadata={"scope": "generic"})
+        assert updated.updated == 1 and kb.documents({"brand": "Tesla"})[-1].metadata["scope"] == "generic"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -205,6 +228,40 @@ def test_blank_input_rejected() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_quality_audit_and_safe_cleaning() -> None:
+    """网页页脚残留应被清洗/提示，但审计不应擅自删除用户文档。"""
+    kb, tmp = _kb()
+    try:
+        noisy = "ACC 可通过方向盘按键开启。\n内容合作\n责任编辑：测试\nACC 可通过方向盘按键开启。"
+        result = kb.add_text("ACC 操作", noisy, source="网页")
+        assert result.added == 1
+        saved = kb.documents()[0].text
+        assert "内容合作" not in saved and saved.count("ACC 可通过") == 1, saved
+        q = assess_document_quality(noisy)
+        assert q["warnings"], q
+        audit = kb.audit_quality(include_clean=True)
+        assert len(audit) == 1 and audit[0]["doc_id"] == kb.entries()[0]["doc_id"], audit
+        assert kb.stats()["n_docs"] == 1, "质量审计只能报告，不能自动删除资料"
+        print("  ✔ 资料质量：清洗确定性页脚/重复行，审计仅提示不删除")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_quality_audit_flags_unverified_source_tier() -> None:
+    """公开网页可保留作参考，但必须在审计中被显式标识为非权威证据。"""
+    kb, tmp = _kb()
+    try:
+        result = kb.add_text(
+            "公开网页", "小米车辆功能介绍的网页摘录。", source="https://example.invalid/article",
+            metadata={"scope": "specific", "brand": "小米", "model": "SU7", "year": "2024", "source_tier": "unverified"},
+        )
+        assert result.added == 1
+        audit = kb.audit_quality(include_clean=True)
+        assert "公开网页参考资料" in "；".join(audit[0]["warnings"]), audit
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 TESTS = [
     ("文本导入·去重·覆盖更新", test_text_import_dedupe_and_update),
     ("跨来源内容去重", test_content_dedupe_across_sources),
@@ -215,6 +272,8 @@ TESTS = [
     ("删除/清空/导出", test_remove_clear_and_export),
     ("超长正文截断", test_oversize_text_is_truncated),
     ("空输入拒绝", test_blank_input_rejected),
+    ("资料质量清洗与审计", test_quality_audit_and_safe_cleaning),
+    ("来源等级审计", test_quality_audit_flags_unverified_source_tier),
 ]
 
 

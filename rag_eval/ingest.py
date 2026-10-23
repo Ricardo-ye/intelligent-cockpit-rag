@@ -10,12 +10,37 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 # 由粗到细的分隔符：先按段落，再按句子，最后才硬切
 SEPARATORS: Sequence[str] = ("\n\n", "\n", "。", "！", "？", "；", ". ", "! ", "? ", "; ", "，", ", ", " ")
+_INGEST_BOILERPLATE_RE = re.compile(
+    r"^(?:内容合作|商务合作|责任编辑|版权声明|免责声明|联系我们|负责人[：:]|电话[：:]|邮箱[：:]|"
+    r"微信公众号|下载客户端|相关阅读|热门推荐|上一篇|下一篇|返回首页).*$"
+)
+
+
+def clean_retrieval_text(text: str) -> str:
+    """清理会污染检索的网页残留，保留原有事实正文。
+
+    该处理在分块前执行，因而既覆盖新导入文档，也保护已有知识库。只去除明确的
+    页脚/合作信息、HTML 列表残留与相邻重复行；不会根据关键词删改业务内容。
+    """
+    raw = (text or "").replace("<&list>", "").replace("\\/", "/")
+    lines, seen = [], set()
+    for line in raw.splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line or _INGEST_BOILERPLATE_RE.match(line):
+            continue
+        # 长网页常在正文容器和全页 fallback 中重复同一段，保留首次出现即可。
+        key = line[:300]
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 class IngestError(RuntimeError):
@@ -28,6 +53,8 @@ class Document:
     title: str
     text: str
     source: str = ""
+    # 车型范围不写进正文，避免车型名污染语义召回；由知识库在构建索引前过滤。
+    metadata: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -42,6 +69,7 @@ class Chunk:
     page: Optional[int] = None
     start: int = 0
     end: int = 0
+    metadata: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -111,6 +139,7 @@ def load_json_corpus(path: str | Path) -> List[Document]:
                 title=str(item.get("title") or f"文档{i}"),
                 text=text,
                 source=str(item.get("source") or "local-json"),
+                metadata={str(k): str(v) for k, v in (item.get("metadata") or {}).items() if v is not None},
             )
         )
     if not docs:
@@ -373,12 +402,13 @@ class RecursiveChunker:
         ]
 
     def chunk_document(self, doc: Document) -> List[Chunk]:
-        pieces = self._split_text(doc.text, SEPARATORS)
+        clean_text = clean_retrieval_text(doc.text)
+        pieces = self._split_text(clean_text, SEPARATORS)
         merged = self._merge(pieces)
         out: List[Chunk] = []
         cursor = 0
         for i, text in enumerate(merged):
-            start = doc.text.find(text[:30], cursor) if len(text) >= 30 else doc.text.find(text, cursor)
+            start = clean_text.find(text[:30], cursor) if len(text) >= 30 else clean_text.find(text, cursor)
             if start < 0:
                 start = cursor
             end = start + len(text)
@@ -393,6 +423,7 @@ class RecursiveChunker:
                     page=page,
                     start=start,
                     end=end,
+                    metadata=dict(doc.metadata),
                 )
             )
         return out
@@ -430,5 +461,5 @@ __all__ = [
     "load_pdf", "load_json_corpus", "load_txt", "corpus_hash",
     # 知识库导入支持的扩展加载器
     "load_markdown", "load_csv", "load_docx", "load_html_file", "load_any",
-    "LOADERS", "SUPPORTED_EXTENSIONS",
+    "LOADERS", "SUPPORTED_EXTENSIONS", "clean_retrieval_text",
 ]

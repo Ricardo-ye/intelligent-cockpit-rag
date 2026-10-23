@@ -6,15 +6,19 @@
 
 from __future__ import annotations
 
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .config import RunConfig
 from .index import RetrievalIndex
 from .ingest import Chunk
 from .llm import LLMClient, LLMError
-from .textutils import minmax_normalize, truncate
+from .textutils import (
+    expand_query_entity_aliases, has_topic_support, minmax_normalize,
+    query_coverage, topic_entity_matches, truncate,
+)
 
 
 @dataclass
@@ -24,6 +28,8 @@ class RetrievedChunk:
     vector_score: Optional[float] = None
     bm25_score: Optional[float] = None
     rerank_score: Optional[float] = None
+    query_coverage: Optional[float] = None
+    matched_entities: List[str] = field(default_factory=list)
     rank: int = 0
     source: str = "vector"
 
@@ -38,6 +44,8 @@ class RetrievedChunk:
             "vector_score": None if self.vector_score is None else round(self.vector_score, 6),
             "bm25_score": None if self.bm25_score is None else round(self.bm25_score, 6),
             "rerank_score": None if self.rerank_score is None else round(self.rerank_score, 6),
+            "query_coverage": None if self.query_coverage is None else round(self.query_coverage, 6),
+            "matched_entities": self.matched_entities,
             "source": self.source,
             "text": self.chunk.text,
         }
@@ -53,6 +61,7 @@ class RetrieveStats:
     rerank_latency_s: float = 0.0
     candidates: int = 0
     final: int = 0
+    filtered_low_support: int = 0
     rerank_backend: str = "none"
 
 
@@ -130,42 +139,138 @@ class Retriever:
 
     def retrieve(self, query: str, top_k: Optional[int] = None) -> List[RetrievedChunk]:
         k = top_k or self.cfg.top_k
+        # 只在召回/重排阶段补充“ACC → 自适应巡航”等价词。原问题仍用于界面展示，
+        # 生成器也只依据真实手册证据作答，避免查询扩展变成未经证实的回答内容。
+        search_query = expand_query_entity_aliases(query)
         stats = RetrieveStats(rerank_backend=self.cfg.rerank_backend)
+        # 主题门控也需要看到比最终 Top-K 更大的候选池：若先截断成前 5 个
+        # 泛“安全”网页，再做过滤，真正的安全带手册即使排第 6 也没有机会入选。
+        # 因此无论是否开启重排，均先扩大召回，再按实体过滤，最后才截断。
+        candidate_k = max(k * 4, 20)
 
         vec_pairs: List[tuple] = []
         bm25_pairs: List[tuple] = []
 
         if self.cfg.use_hybrid:
-            pool = max(k * 4, 20)
+            pool = max(candidate_k, k * 4, 20)
             t = time.perf_counter()
-            vec_pairs = self.index.vector_search(query, pool)
+            vec_pairs = self.index.vector_search(search_query, pool)
             stats.vector_latency_s = round(time.perf_counter() - t, 3)
             t = time.perf_counter()
-            bm25_pairs = self.index.bm25_search(query, pool)
+            bm25_pairs = self.index.bm25_search(search_query, pool)
             stats.bm25_latency_s = round(time.perf_counter() - t, 3)
         else:
             t = time.perf_counter()
-            vec_pairs = self.index.vector_search(query, k)
+            vec_pairs = self.index.vector_search(search_query, candidate_k)
             stats.vector_latency_s = round(time.perf_counter() - t, 3)
 
         t = time.perf_counter()
-        cands = self._fuse(vec_pairs, bm25_pairs, k)
+        cands = self._fuse(vec_pairs, bm25_pairs, candidate_k)
         stats.fusion_latency_s = round(time.perf_counter() - t, 3)
         stats.candidates = len(vec_pairs) + len(bm25_pairs)
+
+        # 先过滤不具备实体支撑的候选，再重排；重排器不应浪费预算比较已确定无关的网页。
+        cands, dropped = self._filter_low_support(search_query, cands)
+        stats.filtered_low_support = dropped
 
         # 重排
         if self.cfg.rerank_backend != "none":
             t = time.perf_counter()
-            cands = self.reranker.rerank(query, cands, self.cfg.rerank_top_k)
+            # ``rerank_top_k`` 是重排后保留的候选池，不应小于最终展示的两倍；
+            # 否则相邻的“条件页”会在最终 Top-K 前被过早丢弃，只留下泛说明页。
+            rerank_pool = max(k * 2, self.cfg.rerank_top_k)
+            cands = self.reranker.rerank(search_query, cands, rerank_pool)
             stats.rerank_latency_s = round(time.perf_counter() - t, 3)
         else:
             cands = cands[:k]
+
+        cands = self._prioritize_safety_boundary_evidence(search_query, cands)
+        cands = self._add_adjacent_page_context(search_query, cands)
+        cands = self._limit_per_document(cands, k)
 
         for i, c in enumerate(cands, 1):
             c.rank = i
         stats.final = len(cands)
         self.last_stats = stats
         return cands
+
+    @staticmethod
+    def _prioritize_safety_boundary_evidence(query: str, cands: List[RetrievedChunk]) -> List[RetrievedChunk]:
+        """限制/禁用类问题优先保留明确的边界条件原文。
+
+        这是检索排序规则而非回答规则：只有用户明确问“哪些情况、不适合、何时、请勿”
+        时才触发，且证据必须出现“无法正常工作、请勿开启、恶劣天气”等原文表达。
+        """
+        if not re.search(r"(?:情况|不适合|何时|请勿)", query):
+            return cands
+        boundary = re.compile(r"(?:无法正常工作|请勿开启|恶劣天气|特殊或复杂路况)")
+        return sorted(
+            cands,
+            key=lambda c: (
+                1 if boundary.search(c.chunk.text) else 0,
+                c.rerank_score if c.rerank_score is not None else c.score,
+            ),
+            reverse=True,
+        )
+
+    def _add_adjacent_page_context(self, query: str, cands: List[RetrievedChunk]) -> List[RetrievedChunk]:
+        """为限制类问题保留命中块的同页下一分块，恢复被 chunk_size 切断的规则列表。"""
+        if not re.search(r"(?:情况|不适合|何时|请勿)", query):
+            return cands
+        boundary = re.compile(r"(?:无法正常工作|请勿开启|恶劣天气|特殊或复杂路况)")
+        expanded: List[RetrievedChunk] = []
+        seen = set()
+        for candidate in cands:
+            if candidate.chunk.chunk_id not in seen:
+                expanded.append(candidate)
+                seen.add(candidate.chunk.chunk_id)
+            if not boundary.search(candidate.chunk.text):
+                continue
+            row = self.index.chunks.index(candidate.chunk)
+            if row + 1 >= len(self.index.chunks):
+                continue
+            neighbor = self.index.chunks[row + 1]
+            if (neighbor.doc_id != candidate.chunk.doc_id or neighbor.page != candidate.chunk.page
+                    or neighbor.chunk_id in seen):
+                continue
+            neighbor_text = f"{neighbor.doc_title}\n{neighbor.text}"
+            expanded.append(RetrievedChunk(
+                chunk=neighbor,
+                score=max(0.0, candidate.score - 0.0001),
+                query_coverage=query_coverage(query, neighbor_text),
+                matched_entities=topic_entity_matches(query, neighbor_text),
+                source=f"{candidate.source}+adjacent-page",
+            ))
+            seen.add(neighbor.chunk_id)
+        return expanded
+
+    def _filter_low_support(self, query: str, cands: List[RetrievedChunk]) -> tuple[List[RetrievedChunk], int]:
+        threshold = float(self.cfg.min_query_coverage)
+        kept: List[RetrievedChunk] = []
+        for c in cands:
+            candidate_text = f"{c.chunk.doc_title}\n{c.chunk.text}"
+            coverage = query_coverage(query, candidate_text)
+            c.query_coverage = coverage
+            c.matched_entities = topic_entity_matches(query, candidate_text)
+            # 即使用户将覆盖率阈值设为 0，也不能关闭“主题实体必须命中”这条
+            # 安全底线；0 只表示关闭比例门槛，不能允许无关主题进入生成器。
+            if coverage >= threshold and has_topic_support(query, candidate_text):
+                kept.append(c)
+        return kept, len(cands) - len(kept)
+
+    def _limit_per_document(self, cands: List[RetrievedChunk], k: int) -> List[RetrievedChunk]:
+        """保留排序的同时限制单篇文档占位，给不同来源留下互证空间。"""
+        seen: Dict[str, int] = {}
+        out: List[RetrievedChunk] = []
+        for c in cands:
+            n = seen.get(c.chunk.doc_id, 0)
+            if n >= self.cfg.max_chunks_per_doc:
+                continue
+            seen[c.chunk.doc_id] = n + 1
+            out.append(c)
+            if len(out) >= k:
+                break
+        return out
 
     def _fuse(self, vec_pairs, bm25_pairs, k: int) -> List[RetrievedChunk]:
         """分数融合。仅向量/仅 BM25/混合三种路径。"""

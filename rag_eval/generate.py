@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
@@ -17,7 +18,7 @@ from .config import RunConfig
 from .ingest import Chunk
 from .llm import LLMClient, LLMError
 from .retrieve import RetrievedChunk
-from .textutils import overlap_ratio, split_sentences, token_f1
+from .textutils import has_topic_support, overlap_ratio, query_topic_entities, split_sentences, token_f1
 
 RAG_SYSTEM_PROMPT = (
     "你是一个严谨的智能座舱知识助手。只能依据【参考资料】回答问题，"
@@ -38,7 +39,7 @@ CHAT_SYSTEM_PROMPT = (
 # ─────────────────────────────────────────────
 # 多轮追问：把指代型问题改写成可独立检索的查询
 # ─────────────────────────────────────────────
-FOLLOWUP_STARTERS = ("那", "那么", "还有", "这个", "那个", "再", "继续", "它", "他", "其", "呢")
+FOLLOWUP_STARTERS = ("那", "那么", "还有", "这个", "那个", "再", "继续", "它", "他", "其", "上面", "刚才", "前面")
 FOLLOWUP_PRONOUNS = ("它", "他", "这个", "那个", "这些", "那些", "其", "该", "上面", "刚才", "前面")
 REWRITE_MAX_CHARS = 120
 
@@ -53,14 +54,14 @@ def _last_user_text(history: Optional[Sequence[dict]]) -> str:
 def looks_like_followup(question: str, history: Optional[Sequence[dict]]) -> bool:
     """判断一个问题是否是「依赖上文的追问」。
 
-    短问题、以「那/还有/再」开头、或含明显指代词 → 视为追问。
-    只是启发式判断，判错了也不会有害：最坏情况是把上一轮问题拼进检索词。
+    以「那/还有/再」开头或含明显指代词 → 视为追问。
+
+    不能仅因问题短而判为追问：例如「座椅加热有哪几种开启方式？」虽然短，
+    却是自足的新主题；若把上一轮 ACC 问题拼进去，会直接把检索带偏。
     """
     q = (question or "").strip()
     if not q or not history:
         return False
-    if len(q) <= 14:
-        return True
     if any(q.startswith(s) for s in FOLLOWUP_STARTERS):
         return True
     return any(p in q for p in FOLLOWUP_PRONOUNS)
@@ -97,6 +98,12 @@ def build_retrieval_query(question: str, history: Optional[Sequence[dict]] = Non
         except LLMError:
             pass
 
+    # 离线回退不能机械拼接整轮问题：例如“ACC 如何开启？ 那哪些情况不适合？”
+    # 会让“开启”这类旧意图稀释本轮的限制条件。优先继承上一问可识别的功能实体，
+    # 既保留指代对象，也让本轮意图成为检索重点。
+    inherited_entities = query_topic_entities(prev)
+    if inherited_entities:
+        return f"{' '.join(inherited_entities[:2])} {question}".strip(), True
     return f"{prev} {question}".strip(), True
 
 
@@ -111,6 +118,8 @@ class GeneratedAnswer:
     context_chars: int = 0
     compress_s: float = 0.0      # 上下文压缩单独计时，避免混进生成耗时
     error: Optional[str] = None
+    abstained: bool = False
+    abstain_reason: Optional[str] = None
     rewritten_query: Optional[str] = None   # 多轮改写后的检索词（便于界面透明展示）
     history_turns: int = 0                  # 本轮实际带入了多少轮历史
 
@@ -125,6 +134,8 @@ class GeneratedAnswer:
             "context_chars": self.context_chars,
             "compress_s": round(self.compress_s, 3),
             "error": self.error,
+            "abstained": self.abstained,
+            "abstain_reason": self.abstain_reason,
             "rewritten_query": self.rewritten_query,
             "history_turns": self.history_turns,
         }
@@ -161,6 +172,8 @@ class ContextCompressor:
                         vector_score=rc.vector_score,
                         bm25_score=rc.bm25_score,
                         rerank_score=rc.rerank_score,
+                        query_coverage=rc.query_coverage,
+                        matched_entities=list(rc.matched_entities),
                         rank=rc.rank,
                         source=rc.source + "+compressed",
                     )
@@ -208,17 +221,19 @@ class AnswerGenerator:
 
     def generate(self, question: str, contexts: List[RetrievedChunk],
                  history: Optional[Sequence[dict]] = None,
-                 max_history_turns: int = 3) -> GeneratedAnswer:
+                  max_history_turns: int = 3,
+                  retrieval_query: Optional[str] = None) -> GeneratedAnswer:
         """生成答案。
 
         ``history`` 仅在多轮对话场景传入（``[{role:'user'|'assistant', content:str}, ...]``，旧→新）。
         评测链路不传 history，因此提示词与历史指标口径完全不变。
         """
-        turns = self._trim_history(history, max_history_turns)
+        turns = self._trim_history(history, max_history_turns, self.cfg.max_history_chars)
+        retrieval_query = (retrieval_query or build_retrieval_query(question, turns, self.llm)[0]).strip()
         compress_s = 0.0
         if self.cfg.use_compression:
             t_c = time.perf_counter()
-            contexts = self.compressor.compress(question, contexts)
+            contexts = self.compressor.compress(retrieval_query, contexts)
             compress_s = time.perf_counter() - t_c
 
         ctx_block, used_ids, used_contexts = self._build_context(contexts)
@@ -229,12 +244,28 @@ class AnswerGenerator:
                 vector_score=rc.vector_score,
                 bm25_score=rc.bm25_score,
                 rerank_score=rc.rerank_score,
+                query_coverage=rc.query_coverage,
+                matched_entities=list(rc.matched_entities),
                 rank=rc.rank,
                 source=rc.source,
             )
             for rc, chunk in zip(contexts, used_contexts)
         ]
         t0 = time.perf_counter()
+
+        if not used_contexts:
+            return GeneratedAnswer(
+                answer="资料不足，无法回答。",
+                mode=self.mode,
+                used_chunk_ids=used_ids,
+                used_contexts=used_contexts,
+                latency_s=time.perf_counter() - t0,
+                history_turns=len(turns) // 2,
+                context_chars=len(ctx_block),
+                compress_s=compress_s,
+                abstained=True,
+                abstain_reason="没有通过主题实体与支撑门槛的参考资料",
+            )
 
         if self.mode == "llm":
             try:
@@ -248,8 +279,19 @@ class AnswerGenerator:
                 )
         else:
             answer = self._extractive_answer(
-                build_retrieval_query(question, turns)[0], effective_contexts
+                retrieval_query, effective_contexts
             )
+
+        # 离线抽取不经过 Prompt；即使上游因缓存或配置异常送入了无关资料，
+        # 也不能仅凭“安全、正确”等泛词把它呈现为答案。
+        abstained = answer == "资料不足，无法回答。"
+        abstain_reason: Optional[str] = None
+        # 多轮追问的原句可能只含“那/这个”等指代，不能拿它做最终主题校验；
+        # 应使用已继承功能实体的 retrieval_query。单轮时二者相同。
+        if self.mode == "extractive" and not abstained and not has_topic_support(retrieval_query, answer):
+            answer = "资料不足，无法回答。"
+            abstained = True
+            abstain_reason = "抽取结果未覆盖问题的核心功能实体"
 
         return GeneratedAnswer(
             answer=answer,
@@ -261,28 +303,40 @@ class AnswerGenerator:
             context_chars=len(ctx_block),
             compress_s=compress_s,
             history_turns=len(turns) // 2,
+            rewritten_query=retrieval_query if retrieval_query != question else None,
+            abstained=abstained,
+            abstain_reason=abstain_reason,
         )
 
     @staticmethod
-    def _trim_history(history: Optional[Sequence[dict]], max_turns: int) -> List[dict]:
+    def _trim_history(history: Optional[Sequence[dict]], max_turns: int,
+                      max_chars: Optional[int] = None) -> List[dict]:
         """只保留最近 max_turns 轮（一轮 = 一问一答），并按 user/assistant 交替截断。
 
         截断必须从「user」开始，否则会出现「历史第一条是助手回答」这种残缺上下文。
         """
         if not history:
             return []
-        msgs = [m for m in history if (m or {}).get("content")]
+        msgs = [m for m in history if (m or {}).get("content") and m.get("role") in ("user", "assistant")]
         if max_turns > 0:
             msgs = msgs[-max_turns * 2:]
         while msgs and msgs[0].get("role") != "user":
             msgs.pop(0)
+        # 优先成对剔除最早轮次，不把孤立的助手回答留在历史开头。这样历史再长也
+        # 不会挤掉本轮资料与问题；最后一轮仍保留，供指代消解使用。
+        if max_chars:
+            while len(msgs) > 2 and sum(len(str(m.get("content", ""))) for m in msgs) > max_chars:
+                del msgs[:2]
+            if len(msgs) <= 2 and sum(len(str(m.get("content", ""))) for m in msgs) > max_chars:
+                budget = max(64, max_chars // len(msgs))
+                msgs = [{**m, "content": str(m.get("content", ""))[:budget]} for m in msgs]
         return msgs
 
     # ── 上下文拼装（受 max_context_chars 约束）──
     def _build_context(self, contexts: List[RetrievedChunk]) -> tuple:
         parts, used, actual, total = [], [], [], 0
         for i, rc in enumerate(contexts, 1):
-            prefix = f"[{i}] "
+            prefix = f"[{i}] 来源：{rc.chunk.doc_title}\n"
             separator_chars = 2 if parts else 0
             remaining = self.cfg.max_context_chars - total - separator_chars
             if remaining <= len(prefix):
@@ -319,28 +373,95 @@ class AnswerGenerator:
             max_tokens=self.cfg.llm_max_tokens,
         ) or "").strip()
 
-    @staticmethod
-    def _extractive_answer(question: str, contexts: List[RetrievedChunk]) -> str:
-        """离线抽取式：按句与问题的相关度排序，取真实原句。"""
-        scored: List[tuple] = []
-        for rc in contexts:
-            for s in split_sentences(rc.chunk.text):
-                score = max(token_f1(s, question), overlap_ratio(s, question))
-                scored.append((score, s))
-        if not scored:
-            return "资料不足，无法回答。"
-        scored.sort(key=lambda x: -x[0])
-        picked, seen = [], set()
-        for score, s in scored:
-            if score <= 0.0 or s in seen:
+    @classmethod
+    def _manual_units(cls, text: str) -> List[str]:
+        """保留手册的标题、编号步骤和项目符号，合并 PDF 的断行。"""
+        lines: List[str] = []
+        for raw in (text or "").splitlines():
+            line = re.sub(r"\s+", " ", raw).strip()
+            if not line or re.fullmatch(r"\d+", line):  # 页脚页码不是回答证据
                 continue
-            picked.append(s)
-            seen.add(s)
-            if sum(len(p) for p in picked) >= min(200, max(80, len(question) * 4)):
-                break
-        if not picked:
+            # Markdown 标题、横杠列表是网页/规范文档的展示结构，历史行为不会把它们
+            # 当作自然语言答案；PDF 里的“1.”、“•”步骤仍会被保留。
+            if line.startswith("#") or re.match(r"^(?:[-*+])\s+", line):
+                continue
+            if lines and not cls._is_heading(lines[-1]) and not re.match(r"^(?:\d+[.、]|[-*+•])\s*", line) and not re.match(r"^(?:#|注意[:：]|说明[:：]|危险[:：])", line):
+                # PDF 常在行宽处硬换行。前行未结束或本行以连接词开头时，应视为同一句。
+                if not re.search(r"[。！？；：:]$", lines[-1]) or re.match(r"^(?:于|或|及|并|且|、|，|。)", line):
+                    lines[-1] += line
+                    continue
+            lines.append(line)
+        return lines
+
+    @staticmethod
+    def _is_heading(unit: str) -> bool:
+        return (
+            len(unit) <= 28
+            and not re.match(r"^(?:\d+[.、]|[-*+•])\s*", unit)
+            and not re.search(r"[，、。！？；：:]", unit)
+        )
+
+    @classmethod
+    def _evidence_block(cls, units: List[str], anchor: int, question: str) -> str:
+        """从命中标题/引导句向后保留连续步骤，避免把不同页的碎句硬拼。"""
+        out = [units[anchor]]
+        include_lists = cls._is_heading(units[anchor]) or bool(
+            re.search(r"(?:以下|包括|功能|步骤|方法|条件|情况|请勿|无法)", units[anchor])
+        )
+        for unit in units[anchor + 1:]:
+            is_list = bool(re.match(r"^(?:\d+[.、]|[-*+•])\s*", unit))
+            if is_list and include_lists:
+                out.append(unit)
+                if len(out) >= 8:
+                    break
+                continue
+            # 标题后的第一段说明通常是答案的一部分（例如 App 操作入口）。
+            if cls._is_heading(units[anchor]) and len(out) == 1 and len(unit) <= 150:
+                out.append(unit)
+                continue
+            break
+        text = "；".join(item.rstrip("；") for item in out if item)
+        return text
+
+    @classmethod
+    def _extractive_answer(cls, question: str, contexts: List[RetrievedChunk]) -> str:
+        """离线抽取式：以单一连续证据块回答，保留步骤、条件与来源页码。
+
+        旧实现把不同上下文中的高分句拼接，容易得到“标题 + 半句 + 无关警告”的回答。
+        此处先找锚点，再只扩展同页相邻的编号步骤或项目符号，宁可简短也不跨页臆拼。
+        """
+        candidates: List[tuple] = []
+        for rc in contexts:
+            units = cls._manual_units(rc.chunk.text)
+            for index, unit in enumerate(units):
+                lexical = max(token_f1(unit, question), overlap_ratio(unit, question))
+                # 对“安全带/ACC”等核心实体命中的证据提高优先级；实体由上游已校验。
+                entity_bonus = 0.08 if has_topic_support(question, unit) else 0.0
+                if lexical >= 0.08 or entity_bonus:
+                    block = cls._evidence_block(units, index, question)
+                    score = lexical + entity_bonus + min(rc.score, 1.0) * 0.02
+                    # 对“什么情况下/不适合使用”类安全边界问题，含明确禁用条件的
+                    # 连续证据比泛化功能说明优先，避免只答“请谨慎使用”。
+                    if re.search(r"(?:情况|不适合|请勿|何时)", question):
+                        # “无法正常工作 / 请勿开启”是手册中明确的功能边界，
+                        # 优先级应高于“请保持注意力”这类泛安全提醒。
+                        if re.search(r"(?:恶劣天气|特殊或复杂路况|以下任一条件|请勿开启)", block):
+                            score += 0.32
+                        elif "无法正常工作" in block:
+                            score += 0.15
+                        elif "不安全的交通" in block:
+                            score += 0.12
+                    candidates.append((score, block, rc.chunk.page))
+        if not candidates:
             return "资料不足，无法回答。"
-        return "".join(picked)
+
+        candidates.sort(key=lambda row: (-row[0], -len(row[1])))
+        best_score, best, page = candidates[0]
+        if best_score < 0.08:
+            return "资料不足，无法回答。"
+        # 页码属于实际检索块，不依赖模型生成；UI 的来源卡片仍保留完整原文供核验。
+        citation = f"（依据用户手册第 {page} 页）" if page else ""
+        return best + citation
 
     @staticmethod
     def _parse_citations(answer: str) -> List[int]:

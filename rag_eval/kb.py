@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,8 +35,43 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .config import DATA_DIR
 from .ingest import (
-    LOADERS, SUPPORTED_EXTENSIONS, Document, IngestError, corpus_hash, load_json_corpus,
+    LOADERS, SUPPORTED_EXTENSIONS, Document, IngestError, clean_retrieval_text, corpus_hash, load_json_corpus,
 )
+
+_VEHICLE_META_KEYS = ("brand", "model", "year", "trim")
+
+
+def _clean_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """只保存可展示、可比较的元数据，避免任意对象进入清单 JSON。"""
+    return {
+        str(k).strip().lower(): str(v).strip()
+        for k, v in (metadata or {}).items()
+        if str(k).strip() and v is not None and str(v).strip()
+    }
+
+
+def _matches_vehicle_scope(metadata: Dict[str, str], vehicle_scope: Optional[Dict[str, str]]) -> bool:
+    """通用资料始终可用；车型专属资料必须与已填写的字段逐项匹配。
+
+    旧资料没有车型字段。当用户主动指定车型时，旧资料不参与回答，避免历史网页
+    抓取内容跨品牌、跨年款串入；未指定车型时则保留原有通用检索体验。
+    """
+    scope = _clean_metadata(vehicle_scope)
+    if not scope:
+        return True
+    meta = _clean_metadata(metadata)
+    if meta.get("scope") == "generic":
+        return True
+    if not any(meta.get(k) for k in _VEHICLE_META_KEYS):
+        return False
+    for key in _VEHICLE_META_KEYS:
+        wanted = scope.get(key)
+        actual = meta.get(key)
+        if wanted and actual and wanted.casefold() != actual.casefold():
+            return False
+        if wanted and not actual:
+            return False
+    return True
 
 def default_kb_dir() -> Path:
     """知识库默认位置：`data/kb`，可用环境变量 ``RAG_KB_DIR`` 覆盖。
@@ -53,6 +89,7 @@ MANIFEST_NAME = "manifest.json"
 MAX_DOC_CHARS = 300_000          # 单篇上限，防止超大网页把索引撑爆（超出部分截断并标注）
 
 _SLUG_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
+_QUALITY_NOISE_RE = re.compile(r"内容合作|商务合作|责任编辑|免责声明|联系我们|公众号|下载客户端|热门推荐|相关阅读")
 
 
 class KBError(RuntimeError):
@@ -71,7 +108,17 @@ def _atomic_write_text(path: Path, content: str, *, backup: bool = False) -> Non
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
+        # Windows 上杀毒软件、索引器或刚释放的读取句柄偶尔会短暂占用文件。
+        # 保留原子替换语义，只对这种瞬时 PermissionError 做极短退避重试；
+        # 持续失败仍原样抛出，避免掩盖真实的目录权限问题。
+        for attempt in range(3):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
@@ -100,6 +147,24 @@ def _clip(text: str) -> tuple:
     if len(text) <= MAX_DOC_CHARS:
         return text, False
     return text[:MAX_DOC_CHARS], True
+
+
+def assess_document_quality(text: str) -> Dict[str, Any]:
+    """给入库文本一个可解释的保守质量提示，不自动删除用户文档。"""
+    raw = (text or "").strip()
+    clean = clean_retrieval_text(raw)
+    warnings: List[str] = []
+    if len(clean) < 80:
+        warnings.append("正文过短")
+    if _QUALITY_NOISE_RE.search(raw):
+        warnings.append("含网页页脚或推荐位残留")
+    if raw and len(clean) / len(raw) < 0.75:
+        warnings.append("清洗前含较多结构噪声")
+    # 问答聚合页通常混有大量无关标题；只提示人工复核，避免误删有效 FAQ。
+    if len(re.findall(r"[？?]", clean)) >= 8:
+        warnings.append("疑似多主题问答聚合页")
+    score = max(0.0, round(1.0 - 0.18 * len(warnings), 2))
+    return {"score": score, "warnings": warnings, "clean_chars": len(clean)}
 
 
 @dataclass
@@ -188,13 +253,21 @@ class KnowledgeBase:
         if not path.exists():
             return None
         raw = json.loads(path.read_text(encoding="utf-8"))
+        # 清单是车型范围、来源等级等治理字段的权威来源。正文文件只承载内容，
+        # 这样批量修正 200+ 页手册的元数据时无需逐页重写 PDF 抽取结果。
+        metadata = _clean_metadata({
+            **_clean_metadata(raw.get("metadata")),
+            **_clean_metadata(entry.get("metadata")),
+        })
         return Document(doc_id=raw["doc_id"], title=raw["title"], text=raw["text"],
-                        source=raw.get("source", ""))
+                        source=raw.get("source", ""), metadata=metadata)
 
-    def documents(self) -> List[Document]:
-        """按清单顺序返回全部文档（顺序稳定，保证指纹稳定）。"""
+    def documents(self, vehicle_scope: Optional[Dict[str, str]] = None) -> List[Document]:
+        """按清单顺序返回与车型范围匹配的文档（顺序稳定，保证指纹稳定）。"""
         out: List[Document] = []
         for e in self._load()["entries"]:
+            if not _matches_vehicle_scope(e.get("metadata") or {}, vehicle_scope):
+                continue
             d = self.get(e["doc_id"])
             if d is not None:
                 out.append(d)
@@ -217,6 +290,7 @@ class KnowledgeBase:
             "root": str(self.root),
             "n_truncated": sum(1 for e in entries if e.get("truncated")),
             "n_versions": sum(int(e.get("version", 1)) - 1 for e in entries),
+            "n_quality_warnings": sum(1 for e in entries if (e.get("quality") or {}).get("warnings")),
         }
 
     def fingerprint(self) -> str:
@@ -235,25 +309,51 @@ class KnowledgeBase:
                 "版本": e.get("version", 1),
                 "来源": (e.get("source") or "")[:80],
                 "更新时间": e.get("updated_at", ""),
+                "质量提示": "；".join((e.get("quality") or {}).get("warnings", [])) or "—",
             })
         return rows[:limit] if limit else rows
 
+    def audit_quality(self, include_clean: bool = False) -> List[dict]:
+        """审计现有文档质量；仅报告，不会自动移除任何用户数据。"""
+        rows: List[dict] = []
+        for entry in self._load()["entries"]:
+            doc = self.get(entry["doc_id"])
+            if doc is None:
+                continue
+            quality = assess_document_quality(doc.text)
+            warnings = list(quality.get("warnings") or [])
+            source_tier = (doc.metadata.get("source_tier") or "").strip().lower()
+            if not source_tier:
+                warnings.append("未标注来源等级，不能作为车型操作答案的首选证据")
+            elif source_tier == "unverified":
+                warnings.append("公开网页参考资料，需由官方手册或审核知识复核")
+            quality = {**quality, "warnings": warnings}
+            if include_clean or quality["warnings"]:
+                rows.append({
+                    "doc_id": doc.doc_id, "title": doc.title, "source": doc.source,
+                    **quality,
+                })
+        return rows
+
     # ── 写 ────────────────────────────────────
     def _write_doc(self, doc: Document, source_type: str, tags: Sequence[str],
-                   version: int, created_at: str) -> dict:
+                    version: int, created_at: str,
+                    quality: Optional[Dict[str, Any]] = None) -> dict:
         text, truncated = _clip(doc.text)
+        quality = quality or assess_document_quality(text)
         chash = _short_hash(text, 16)
         fname = _safe_filename(doc.doc_id)
         _atomic_write_text(
             self.docs_dir / fname,
             json.dumps({"doc_id": doc.doc_id, "title": doc.title, "text": text,
-                        "source": doc.source}, ensure_ascii=False),
+                        "source": doc.source, "metadata": _clean_metadata(doc.metadata)}, ensure_ascii=False),
         )
         return {
             "doc_id": doc.doc_id, "title": doc.title, "file": fname,
             "source": doc.source, "source_type": source_type,
-            "tags": list(tags), "chars": len(text), "content_hash": chash,
+            "tags": list(tags), "metadata": _clean_metadata(doc.metadata), "chars": len(text), "content_hash": chash,
             "truncated": truncated, "version": version,
+            "quality": quality,
             "added_at": created_at, "updated_at": _now(),
         }
 
@@ -267,10 +367,17 @@ class KnowledgeBase:
         seen_hashes = {e.get("content_hash") for e in entries}
 
         for doc in docs:
-            if not (doc.text or "").strip():
+            raw_quality = assess_document_quality(doc.text)
+            cleaned = clean_retrieval_text(doc.text)
+            if not cleaned:
                 res.skipped += 1
                 res.messages.append(f"跳过空文档：{doc.doc_id}")
                 continue
+
+            # 持久化清洗后的副本。原始来源 URL/文件名仍在 metadata 中，可回溯；
+            # 这里只去除确定的网页模板噪声，不改变可用的业务段落。
+            doc = Document(doc_id=doc.doc_id, title=doc.title, text=cleaned, source=doc.source,
+                           metadata=_clean_metadata(doc.metadata))
 
             text, truncated = _clip(doc.text)
             chash = _short_hash(text, 16)
@@ -283,13 +390,28 @@ class KnowledgeBase:
                 continue
 
             if old is not None and old.get("content_hash") == chash:
-                res.skipped += 1
-                res.messages.append(f"内容未变，无需更新：{doc.title[:40]}")
+                desired_metadata = _clean_metadata(doc.metadata)
+                desired_tags = list(tags or [])
+                if old.get("metadata") == desired_metadata and old.get("tags", []) == desired_tags:
+                    res.skipped += 1
+                    res.messages.append(f"内容未变，无需更新：{doc.title[:40]}")
+                    continue
+                # 元数据变更也必须持久化；否则上传者修正车型标签后，检索仍会沿用旧范围。
+                entry = self._write_doc(doc, source_type, desired_tags, int(old.get("version", 1)),
+                                        old.get("added_at") or _now(), quality=raw_quality)
+                entries[entries.index(old)] = entry
+                by_id[doc.doc_id] = entry
+                res.updated += 1
+                res.messages.append(f"已更新车型范围：{doc.title[:40]}")
+                res.docs.append({"doc_id": doc.doc_id, "title": doc.title,
+                                 "chars": len(text), "version": entry["version"]})
                 continue
 
             version = int(old.get("version", 1)) + 1 if old else 1
             created = old.get("added_at") if old else _now()
-            entry = self._write_doc(doc, source_type, tags or [], version, created or _now())
+            entry = self._write_doc(
+                doc, source_type, tags or [], version, created or _now(), quality=raw_quality,
+            )
 
             if old is not None:
                 if old.get("file") and old["file"] != entry["file"]:
@@ -304,6 +426,9 @@ class KnowledgeBase:
 
             if truncated:
                 res.messages.append(f"⚠ 正文超过 {MAX_DOC_CHARS} 字已截断：{doc.title[:40]}")
+            quality = entry.get("quality") or {}
+            if quality.get("warnings"):
+                res.messages.append(f"⚠ 建议复核资料质量：{doc.title[:40]}（{'；'.join(quality['warnings'])}）")
             by_id[doc.doc_id] = entry
             seen_hashes.add(chash)
             res.docs.append({"doc_id": doc.doc_id, "title": doc.title,
@@ -314,7 +439,8 @@ class KnowledgeBase:
         return res
 
     def add_text(self, title: str, text: str, source: str = "手工粘贴",
-                 source_type: str = "粘贴文本", tags: Optional[Sequence[str]] = None) -> ImportResult:
+                 source_type: str = "粘贴文本", tags: Optional[Sequence[str]] = None,
+                 metadata: Optional[Dict[str, Any]] = None) -> ImportResult:
         text = (text or "").strip()
         if len(text) < 5:
             r = ImportResult(failed=1)
@@ -322,11 +448,12 @@ class KnowledgeBase:
             return r
         title = (title or "").strip() or (text[:24] + ("…" if len(text) > 24 else ""))
         doc_id = f"{_slug(source)}::{_slug(title)}-{_short_hash(source + title)}"
-        doc = Document(doc_id=doc_id, title=title, text=text, source=source)
+        doc = Document(doc_id=doc_id, title=title, text=text, source=source, metadata=_clean_metadata(metadata))
         return self.add_documents([doc], source_type=source_type, tags=tags)
 
     def add_file(self, path: str | Path, source_type: Optional[str] = None,
-                 tags: Optional[Sequence[str]] = None) -> ImportResult:
+                 tags: Optional[Sequence[str]] = None,
+                 metadata: Optional[Dict[str, Any]] = None) -> ImportResult:
         """按扩展名加载并入库。同一文件重复导入 → 覆盖为最新版本。"""
         p = Path(path)
         if not p.exists():
@@ -350,12 +477,13 @@ class KnowledgeBase:
         ns = _slug(p.stem, 40)
         namespaced = [
             Document(doc_id=f"{ns}::{d.doc_id}", title=d.title, text=d.text,
-                     source=d.source or p.name)
+                     source=d.source or p.name, metadata=_clean_metadata(metadata) or d.metadata)
             for d in docs
         ]
         return self.add_documents(namespaced, source_type=source_type or type_name, tags=tags)
 
-    def add_url(self, url: str, tags: Optional[Sequence[str]] = None) -> ImportResult:
+    def add_url(self, url: str, tags: Optional[Sequence[str]] = None,
+                metadata: Optional[Dict[str, Any]] = None) -> ImportResult:
         """抓取单个 URL 并入库。抓取失败只记错误，不会污染知识库。"""
         from .webimport import fetch_url
 
@@ -368,10 +496,13 @@ class KnowledgeBase:
         # 早先这里自己拼 `web::<site>::<hash>`，与 to_documents() 的 `web-<site>-<sha1>`
         # 不一致 —— 同一个 URL 从命令行导入和从界面导入会拿到两个 doc_id，
         # 于是同一篇网页被存成两份，「同来源覆盖」形同虚设。
-        return self.add_documents([d.to_document()], source_type="联网网页", tags=tags)
+        doc = d.to_document()
+        doc.metadata = _clean_metadata(metadata)
+        return self.add_documents([doc], source_type="联网网页", tags=tags)
 
     def add_search_results(self, hits: Sequence[Any], n: int = 3,
-                           tags: Optional[Sequence[str]] = None) -> ImportResult:
+                           tags: Optional[Sequence[str]] = None,
+                           metadata: Optional[Dict[str, Any]] = None) -> ImportResult:
         """把搜索结果前 n 条抓取后入库（逐条记录成功与失败）。"""
         from .webimport import fetch_url
 
@@ -388,6 +519,7 @@ class KnowledgeBase:
             # 与 add_url / to_documents 共用同一套 doc_id（见 add_url 注释）
             doc = d.to_document()
             doc.title = d.title or h.title
+            doc.metadata = _clean_metadata(metadata)
             sub = self.add_documents([doc], source_type="联网网页", tags=tags)
             res.added += sub.added
             res.updated += sub.updated
@@ -410,8 +542,67 @@ class KnowledgeBase:
             r.errors.append(f"内置语料加载失败：{exc}")
             return r
         namespaced = [Document(doc_id=f"内置样例::{d.doc_id}", title=d.title,
-                               text=d.text, source="data/sample_corpus.json") for d in docs]
+                               text=d.text, source="data/sample_corpus.json",
+                               metadata={"scope": "generic", "source_tier": "demo"}) for d in docs]
         return self.add_documents(namespaced, source_type="内置样例")
+
+    def update_metadata(self, doc_ids: Sequence[str], metadata: Dict[str, Any], *,
+                        replace_vehicle_scope: bool = False) -> ImportResult:
+        """批量修正已入库资料的元数据，不改正文、不删除文档。
+
+        适用于用户先以“通用资料”导入、后确认车型范围的场景。正文内容哈希和
+        版本号保持不变；仅清单、文档副本与知识库指纹更新，因此下一次问答会安全
+        重建索引。
+        """
+        wanted = {str(doc_id) for doc_id in doc_ids if str(doc_id).strip()}
+        incoming = _clean_metadata(metadata)
+        result = ImportResult()
+        if not wanted:
+            result.failed = 1
+            result.errors.append("未选择需要更新元数据的资料。")
+            return result
+        if not incoming:
+            result.failed = 1
+            result.errors.append("元数据为空，未执行更新。")
+            return result
+
+        manifest = self._load()
+        for index, entry in enumerate(manifest["entries"]):
+            doc_id = str(entry.get("doc_id") or "")
+            if doc_id not in wanted:
+                continue
+            doc = self.get(doc_id)
+            if doc is None:
+                result.failed += 1
+                result.errors.append(f"文档文件缺失，无法更新：{doc_id}")
+                continue
+            merged = dict(doc.metadata)
+            if replace_vehicle_scope:
+                for key in ("scope", *_VEHICLE_META_KEYS):
+                    merged.pop(key, None)
+            merged.update(incoming)
+            if _clean_metadata(doc.metadata) == _clean_metadata(merged):
+                result.skipped += 1
+                continue
+
+            # 元数据修正不是正文版本升级。仅更新清单即可：get() 会将清单中的
+            # 元数据覆盖到原始正文文件，避免批量改写数百个页级 JSON 导致卡顿。
+            updated = dict(entry)
+            updated["metadata"] = _clean_metadata(merged)
+            updated["updated_at"] = _now()
+            manifest["entries"][index] = updated
+            result.updated += 1
+            result.docs.append({"doc_id": doc_id, "title": doc.title,
+                                "chars": updated["chars"], "version": updated["version"]})
+            result.messages.append(f"已更新车型元数据：{doc.title[:50]}")
+
+        missing = wanted - {str(e.get("doc_id") or "") for e in manifest["entries"]}
+        if missing:
+            result.failed += len(missing)
+            result.errors.append(f"未找到 {len(missing)} 篇待更新资料。")
+        if result.updated:
+            self._save()
+        return result
 
     def remove(self, doc_id: str) -> bool:
         m = self._load()

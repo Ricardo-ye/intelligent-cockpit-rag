@@ -41,6 +41,7 @@ from rag_eval.config import (  # noqa: E402
     is_reasoning_model, recommended_max_tokens,
 )
 from rag_eval.ingest import load_json_corpus  # noqa: E402
+from rag_eval.recommend import supported_sample_questions  # noqa: E402
 from rag_eval.security import resolve_upload_path  # noqa: E402
 
 st.set_page_config(
@@ -94,6 +95,9 @@ STATE_DEFAULTS = {
     "kb_hits": None,              # 最近一次联网搜索的候选列表
     "kb_hits_query": "",
     "kb_confirm_clear": False,
+    # 本项目的目标范围为小米电车全系。留空车型表示用户可继续补充 SU7 / YU7、
+    # 年款与配置；检索仍只会使用“小米”或通用治理资料。
+    "vehicle_brand": "小米",
 }
 for _k, _v in STATE_DEFAULTS.items():
     if _k not in st.session_state:
@@ -539,11 +543,11 @@ def load_docs(S: dict):
     if src == "内置真实样例语料":
         return load_documents_from(builtin=True)
     if src == KB_SOURCE:
-        docs = _KB.documents()
+        docs = _KB.documents(vehicle_scope=_vehicle_scope_from_settings(S))
         if not docs:
             raise IngestError(
-                "知识库为空。请先到「📚 知识库」页导入资料："
-                "上传文件 / 粘贴文本 / 联网导入（网页 URL 或关键词搜索）。"
+                "没有匹配当前车型范围的知识库资料。请调整车型筛选，或到「📚 知识库」页导入"
+                "对应品牌、车型、年款与配置的官方资料。"
             )
         return docs
     if src == "上传 PDF":
@@ -557,6 +561,15 @@ def load_docs(S: dict):
     if f is None:
         raise IngestError("请先上传 TXT 文件。")
     return load_documents_from(txt_path=materialize_upload(f))
+
+
+def _vehicle_scope_from_settings(S: dict) -> dict:
+    """读取问答侧的车型范围；空字段不参与限制。"""
+    return {
+        key: str(S.get(f"vehicle_{key}") or "").strip()
+        for key in ("brand", "model", "year", "trim")
+        if str(S.get(f"vehicle_{key}") or "").strip()
+    }
 
 
 def load_items(S: dict):
@@ -579,6 +592,8 @@ def make_cfg(S: dict) -> RunConfig:
         top_k=int(S["top_k"]),
         use_hybrid=bool(S["use_hybrid"]),
         bm25_weight=float(S["bm25_weight"]),
+        min_query_coverage=float(S.get("min_query_coverage", 0.12)),
+        max_chunks_per_doc=int(S.get("max_chunks_per_doc", 2)),
         rerank_backend=S["rerank_backend"],
         rerank_top_k=int(S["rerank_top_k"]),
         use_compression=bool(S["use_compression"]),
@@ -609,7 +624,8 @@ def build_engine(S: dict, progress=None):
     """构建（或复用）知识库引擎。返回 (engine, cfg, rebuilt)。"""
     cfg = make_cfg(S)
     kb_fp = _KB.fingerprint() if S.get("corpus_source") == KB_SOURCE else ""
-    sig = cfg_signature(cfg, kb_fp)
+    scope_sig = json.dumps(_vehicle_scope_from_settings(S), sort_keys=True, ensure_ascii=False)
+    sig = cfg_signature(cfg, kb_fp) + "|scope=" + scope_sig
     eng = st.session_state.engine
     if eng and eng.get("sig") == sig:
         return eng, cfg, False
@@ -658,6 +674,15 @@ def render_config_panel() -> dict:
                     st.caption("增删文档会自动让索引失效并重建，无需手动操作。")
                 else:
                     st.warning("知识库为空，请到「📚 知识库」页导入资料后回到这里。", icon="⚠️")
+            with st.expander("🚘 目标车型范围（小米电车）", expanded=True):
+                st.caption("默认以小米电车全系为范围。操作类问题建议补充 SU7 / YU7、年款和配置；未标车型的历史网页不会混入。")
+                vm1, vm2 = st.columns(2)
+                with vm1:
+                    vehicle_brand = st.text_input("品牌", key="vehicle_brand", placeholder="例如：小米")
+                    vehicle_year = st.text_input("年款", key="vehicle_year", placeholder="例如：2024")
+                with vm2:
+                    vehicle_model = st.text_input("车型（留空表示全系）", key="vehicle_model", placeholder="例如：SU7 / YU7")
+                    vehicle_trim = st.text_input("配置（可选）", key="vehicle_trim", placeholder="例如：长续航全轮驱动")
             doc_file = None
             if corpus_source == "上传 PDF":
                 doc_file = st.file_uploader("上传知识库文档（PDF）", type=["pdf"], key="pdf_up")
@@ -826,6 +851,14 @@ def render_config_panel() -> dict:
             else:
                 bm25_weight = 0.0
                 st.caption("仅使用向量检索")
+            min_query_coverage = st.slider(
+                "问题支撑下限", 0.0, 0.50, 0.12, 0.01,
+                help="候选需覆盖的问题关键信号比例；低于下限不进入回答，减少答非所问。设为 0 仅关闭比例门槛，主题实体命中仍为必需。",
+            )
+            max_chunks_per_doc = st.number_input(
+                "单文档最多上下文块", 1, 10, 2,
+                help="避免一篇长网页占满上下文，默认保留更多来源以便互证。",
+            )
         with rc3:
             st.markdown("**上下文压缩与缓存**")
             use_compression = st.toggle(
@@ -845,6 +878,7 @@ def render_config_panel() -> dict:
                 chunk_size=chunk_size, chunk_overlap=chunk_overlap, embed_backend=embed_backend,
                 embed_dim=embed_dim, embed_api_model=embed_api_model, top_k=top_k,
                 use_hybrid=use_hybrid, bm25_weight=bm25_weight, rerank_backend=rerank_backend,
+                min_query_coverage=min_query_coverage, max_chunks_per_doc=max_chunks_per_doc,
                 rerank_top_k=rerank_top_k, use_compression=use_compression, llm_backend=llm_backend,
                 llm_model=llm_model, llm_temperature=llm_temperature, llm_max_tokens=llm_max_tokens,
                 use_llm_judge=use_llm_judge, use_cache=use_cache,
@@ -862,11 +896,14 @@ def render_config_panel() -> dict:
 
     return {
         "corpus_source": corpus_source, "doc_file": doc_file,
+        "vehicle_brand": vehicle_brand, "vehicle_model": vehicle_model,
+        "vehicle_year": vehicle_year, "vehicle_trim": vehicle_trim,
         "eval_source": eval_source, "eval_file": eval_file,
         "chunk_size": chunk_size, "chunk_overlap": chunk_overlap,
         "embed_backend": embed_backend, "embed_dim": embed_dim,
         "embed_api_model": embed_api_model, "top_k": top_k,
         "use_hybrid": use_hybrid, "bm25_weight": bm25_weight,
+        "min_query_coverage": min_query_coverage, "max_chunks_per_doc": max_chunks_per_doc,
         "rerank_backend": rerank_backend, "rerank_top_k": rerank_top_k,
         "use_compression": use_compression, "llm_backend": llm_backend,
         "llm_model": llm_model, "llm_temperature": llm_temperature,
@@ -892,6 +929,11 @@ def _kb_metric_row() -> dict:
     m5.metric("最后更新", (stt["updated_at"] or "—")[5:16])
     if stt["by_type"]:
         st.caption("类型分布：" + "　".join(f"`{k}` {v} 篇" for k, v in stt["by_type"].items()))
+    if stt.get("n_quality_warnings"):
+        st.warning(
+            f"已有 {stt['n_quality_warnings']} 篇新导入资料带质量提示；建议执行下方“资料质量审计”后复核来源。",
+            icon="⚠️",
+        )
     return stt
 
 
@@ -946,8 +988,20 @@ def render_kb_panel() -> None:
         if st.button("🧹 清空知识库", width="stretch", disabled=_KB.is_empty()):
             st.session_state.kb_confirm_clear = True
     with tb4:
+        if st.button("🔎 资料质量审计", width="stretch", disabled=_KB.is_empty(),
+                     help="仅检查并报告网页噪声、过短文本和疑似多主题聚合页；不会删除任何资料"):
+            st.session_state["kb_quality_audit"] = _KB.audit_quality(include_clean=False)
         if st.session_state.get("kb_export_path"):
             st.caption(f"最近导出：`{Path(st.session_state['kb_export_path']).name}`")
+
+    audit = st.session_state.get("kb_quality_audit")
+    if audit is not None:
+        with st.expander(f"资料质量审计结果（发现 {len(audit)} 篇待复核）", expanded=bool(audit)):
+            if audit:
+                st.dataframe(pd.DataFrame(audit), width="stretch", hide_index=True)
+                st.caption("审计只提示风险：请优先保留车型手册、官方 FAQ 等一手资料；删除操作仍需由你在文档清单中明确执行。")
+            else:
+                st.success("未发现显著网页噪声或多主题聚合页提示。")
 
     if st.session_state.get("kb_confirm_clear"):
         st.warning("⚠️ 清空会删除知识库内全部文档（磁盘文件一并删除），且不可撤销。"
@@ -973,6 +1027,35 @@ def render_kb_panel() -> None:
 
     # ── 四种导入通道 ──
     st.markdown('<div class="section-title">导入资料 / Import</div>', unsafe_allow_html=True)
+    with st.expander("🏷️ 本次导入的车型范围", expanded=False):
+        st.caption("车型专属资料必须填写品牌、车型、年款；通用资料可保持默认。该范围会在问答检索时生效。小米操作资料优先使用官方用户手册。")
+        import_scope = st.radio(
+            "资料类型", ["通用 / 车型未绑定", "车型专属"], horizontal=True, key="kb_import_scope_type",
+        )
+        im1, im2 = st.columns(2)
+        with im1:
+            import_brand = st.text_input("资料品牌", key="kb_import_brand", placeholder="例如：小米")
+            import_year = st.text_input("资料年款", key="kb_import_year", placeholder="例如：2024")
+        with im2:
+            import_model = st.text_input("资料车型", key="kb_import_model", placeholder="例如：SU7 / YU7")
+            import_trim = st.text_input("资料配置（可选）", key="kb_import_trim", placeholder="例如：长续航全轮驱动")
+        import_source_tier = st.selectbox(
+            "来源等级", ["官方手册 / 官方 FAQ", "内部审核知识", "授权服务资料", "公开网页（仅作参考）"],
+            help="来源等级会写入可追溯元数据；公开网页不能替代小米车型操作的官方依据。",
+            key="kb_import_source_tier",
+        )
+        tier_key = {
+            "官方手册 / 官方 FAQ": "official",
+            "内部审核知识": "reviewed",
+            "授权服务资料": "authorized",
+            "公开网页（仅作参考）": "unverified",
+        }[import_source_tier]
+        import_metadata = ({"scope": "generic", "source_tier": tier_key} if import_scope.startswith("通用") else {
+            "scope": "specific", "brand": import_brand, "model": import_model,
+            "year": import_year, "trim": import_trim, "source_tier": tier_key,
+        })
+        if import_scope == "车型专属" and not all([import_brand.strip(), import_model.strip(), import_year.strip()]):
+            st.warning("车型专属资料至少需要填写品牌、车型和年款；未填写完整时请勿导入。", icon="⚠️")
     im_file, im_text, im_web, im_builtin = st.tabs(
         ["📁 上传文件", "✍️ 粘贴文本", "🌐 联网导入", "📦 内置样例"]
     )
@@ -993,7 +1076,10 @@ def render_kb_panel() -> None:
             with st.spinner("解析并入库中…"):
                 for u in ups:
                     path = _kb_store_upload(u)
-                    r = _KB.add_file(path, tags=["上传"]).to_dict()
+                    if import_scope == "车型专属" and not all([import_brand.strip(), import_model.strip(), import_year.strip()]):
+                        st.error("请先完整填写品牌、车型和年款。")
+                        break
+                    r = _KB.add_file(path, tags=["上传"], metadata=import_metadata).to_dict()
                     for k in ("added", "updated", "skipped", "failed"):
                         agg[k] += r[k]
                     agg["messages"] += r["messages"]
@@ -1012,7 +1098,10 @@ def render_kb_panel() -> None:
                               placeholder="把资料正文粘贴到这里…")
         st.caption(f"当前 {len(t_body or '')} 字。粘贴内容同样参与去重与覆盖更新。")
         if st.button("⬆️ 导入这段文本", type="primary", key="kb_do_text"):
-            r = _KB.add_text(t_title, t_body, source="手工粘贴").to_dict()
+            if import_scope == "车型专属" and not all([import_brand.strip(), import_model.strip(), import_year.strip()]):
+                st.error("请先完整填写品牌、车型和年款。")
+                return
+            r = _KB.add_text(t_title, t_body, source="手工粘贴", metadata=import_metadata).to_dict()
             st.session_state.kb_result = r
             add_log(f"粘贴导入：{r['summary']}", "ok" if not r["failed"] else "warn")
             st.rerun()
@@ -1037,7 +1126,10 @@ def render_kb_panel() -> None:
                 bar = st.progress(0.0, text="抓取中…")
                 for i, u in enumerate(lines, 1):
                     bar.progress(i / len(lines), text=f"抓取 {u[:60]}…")
-                    r = _KB.add_url(u, tags=["联网"]).to_dict()
+                    if import_scope == "车型专属" and not all([import_brand.strip(), import_model.strip(), import_year.strip()]):
+                        st.error("请先完整填写品牌、车型和年款。")
+                        break
+                    r = _KB.add_url(u, tags=["联网"], metadata=import_metadata).to_dict()
                     for k in ("added", "updated", "skipped", "failed"):
                         agg[k] += r[k]
                     agg["messages"] += r["messages"]
@@ -1114,7 +1206,10 @@ def render_kb_panel() -> None:
 
                 chosen = [SimpleNamespace(**hits[i]) for i in picked_idx]
                 with st.spinner("抓取正文并入库…"):
-                    agg = _KB.add_search_results(chosen, n=len(chosen), tags=["联网"]).to_dict()
+                    if import_scope == "车型专属" and not all([import_brand.strip(), import_model.strip(), import_year.strip()]):
+                        st.error("请先完整填写品牌、车型和年款。")
+                        return
+                    agg = _KB.add_search_results(chosen, n=len(chosen), tags=["联网"], metadata=import_metadata).to_dict()
                 st.session_state.kb_result = agg
                 add_log(f"搜索导入完成：{agg['summary']}", "ok" if not agg["failed"] else "warn")
                 st.rerun()
@@ -1150,15 +1245,74 @@ def render_kb_panel() -> None:
         """, unsafe_allow_html=True)
         return
 
+    # 已导入手册可能在早期版本被标为“通用资料”。提供非破坏性的批量校正入口：
+    # 只更新元数据，不会重新解析 PDF、更不会删除正文。年款未知时允许留空，
+    # 此时会按品牌/车型隔离，避免伪造手册版本。
+    with st.expander("🚗 批量修正已入库资料的车型范围", expanded=False):
+        vehicle_candidates = [
+            entry for entry in entries
+            if entry.get("source_type") in ("PDF", "DOCX", "文件", "粘贴文本")
+        ]
+        if not vehicle_candidates:
+            st.caption("当前没有可标注车型范围的本地资料。")
+        else:
+            candidate_ids = [str(entry["doc_id"]) for entry in vehicle_candidates]
+            label_by_id = {
+                str(entry["doc_id"]): f"{entry.get('title', '未命名')} · {entry.get('source', '')}"
+                for entry in vehicle_candidates
+            }
+            chosen_ids = st.multiselect(
+                "选择需要校正的资料", candidate_ids, format_func=lambda doc_id: label_by_id[doc_id],
+                key="kb_metadata_doc_ids",
+                help="可多选同一车型的用户手册页；只会写入车型与来源元数据。",
+            )
+            mc1, mc2, mc3 = st.columns(3)
+            with mc1:
+                meta_brand = st.text_input("品牌", placeholder="例如：小米", key="kb_metadata_brand")
+            with mc2:
+                meta_model = st.text_input("车型", placeholder="例如：SU7", key="kb_metadata_model")
+            with mc3:
+                meta_year = st.text_input("年款（手册未注明可留空）", placeholder="例如：2024", key="kb_metadata_year")
+            meta_tier = st.selectbox(
+                "来源等级", ["官方手册", "内部审核知识", "授权服务资料", "公开网页（仅作参考）"],
+                key="kb_metadata_tier",
+            )
+            tier_key = {"官方手册": "official", "内部审核知识": "reviewed",
+                        "授权服务资料": "authorized", "公开网页（仅作参考）": "unverified"}[meta_tier]
+            if st.button("保存车型元数据", disabled=not chosen_ids, key="kb_save_metadata"):
+                if not meta_brand.strip() or not meta_model.strip():
+                    st.error("请至少填写品牌和车型；年款未知时可留空，系统会保守地不匹配指定年款的查询。")
+                else:
+                    metadata = {"scope": "specific", "brand": meta_brand, "model": meta_model,
+                                "source_tier": tier_key}
+                    if meta_year.strip():
+                        metadata["year"] = meta_year
+                    result = _KB.update_metadata(chosen_ids, metadata, replace_vehicle_scope=True).to_dict()
+                    st.session_state.engine = None
+                    st.session_state.kb_result = result
+                    add_log(f"已修正 {result['updated']} 篇资料的车型范围，索引将在下次问答重建", "ok")
+                    st.rerun()
+
     df = pd.DataFrame(_KB.preview())
+    metadata_by_id = {str(entry["doc_id"]): entry.get("metadata") or {} for entry in entries}
+    df["车型范围"] = [
+        ("通用" if metadata_by_id.get(str(entry["doc_id"]), {}).get("scope") == "generic" else
+         " / ".join(filter(None, [metadata_by_id.get(str(entry["doc_id"]), {}).get("brand"),
+                                    metadata_by_id.get(str(entry["doc_id"]), {}).get("model"),
+                                    metadata_by_id.get(str(entry["doc_id"]), {}).get("year")])) or "未标注")
+        for entry in entries
+    ]
+    df["来源等级"] = [metadata_by_id.get(str(entry["doc_id"]), {}).get("source_tier", "未标注") for entry in entries]
     df.insert(0, "删除", False)
-    show_cols = ["删除", "标题", "类型", "字数", "版本", "来源", "更新时间"]
+    show_cols = ["删除", "标题", "车型范围", "来源等级", "类型", "字数", "版本", "来源", "更新时间"]
     edited = st.data_editor(
         df[show_cols], hide_index=True, width="stretch", key="kb_docs_editor",
         column_config={
             "删除": st.column_config.CheckboxColumn("删除", width="small",
                                                   help="勾选后点下方「删除选中文档」"),
             "标题": st.column_config.TextColumn("标题", width="large"),
+            "车型范围": st.column_config.TextColumn("车型范围", width="medium"),
+            "来源等级": st.column_config.TextColumn("来源等级", width="small"),
             "类型": st.column_config.TextColumn("类型", width="small"),
             "字数": st.column_config.NumberColumn("字数", width="small"),
             "版本": st.column_config.NumberColumn("版本", width="small"),
@@ -1188,7 +1342,10 @@ def _source_card(rc: dict, show_scores: bool) -> str:
     meta = f"#{rc['rank']} · {html.escape(str(rc['doc_title']), quote=True)}"
     if show_scores:
         meta += (f" · score={rc['score']} · vec={rc['vector_score']} "
-                 f"· bm25={rc['bm25_score']} · rerank={rc['rerank_score']}")
+                 f"· bm25={rc['bm25_score']} · rerank={rc['rerank_score']}"
+                 f" · support={rc.get('query_coverage')}")
+        if rc.get("matched_entities"):
+            meta += f" · entities={html.escape(','.join(rc['matched_entities']), quote=True)}"
     meta += f" · doc_id={html.escape(str(rc['doc_id']), quote=True)}"
     return (f'<div class="bubble-src"><div class="h">{meta}</div>'
             f'<div>{html.escape(str(rc["text"]), quote=True)}</div></div>')
@@ -1210,6 +1367,12 @@ def render_turn(msg: dict) -> None:
         if meta.get("error"):
             st.error(f"生成失败：{meta['error']}")
         st.markdown(msg["content"] or "_（空）_")
+        if meta.get("abstained"):
+            st.info(
+                f"已安全拒答：{meta.get('abstain_reason') or '当前资料不足以支撑该问题'}。"
+                "可补充小米官方用户手册，或填写具体车型、年款与配置后再试。",
+                icon="🛡️",
+            )
 
         if st.session_state.ui_show_timing and meta:
             bits = [f"生成模式：`{meta.get('mode', '-')}`"]
@@ -1270,6 +1433,7 @@ def _answer(question: str, S: dict, history: Optional[list] = None) -> dict:
         gen = ev.generator.generate(
             question, retrieved, history=history,
             max_history_turns=int(st.session_state.ui_history_turns),
+            retrieval_query=search_q,
         )
         t_gen = (time.perf_counter() - t0) * 1000
 
@@ -1289,6 +1453,8 @@ def _answer(question: str, S: dict, history: Optional[list] = None) -> dict:
                 "contexts": len(gen.used_chunk_ids),
                 "sources": sources,
                 "error": gen.error,
+                "abstained": gen.abstained,
+                "abstain_reason": gen.abstain_reason,
                 "rewritten_query": search_q if rewritten else None,
                 "history_turns": gen.history_turns,
                 "n_docs": eng.get("n_docs"),
@@ -1367,16 +1533,23 @@ with chat_ph:
         </div>
         """, unsafe_allow_html=True)
         try:
-            _samples = load_eval_set(SAMPLE_EVAL_PATH)[:4]
-            st.caption("试试这些问题（点一下会直接提问）：")
-            bcols = st.columns(len(_samples))
-            for col, it in zip(bcols, _samples):
-                if col.button(it.question[:18] + ("…" if len(it.question) > 18 else ""),
-                              key=f"ex_{it.item_id}", width="stretch"):
-                    st.session_state.pending_q = it.question
-                    st.rerun()
-        except Exception:  # noqa: BLE001
-            pass
+            _samples = supported_sample_questions(load_eval_set(SAMPLE_EVAL_PATH), load_docs(S), limit=4)
+            if _samples:
+                st.caption("已验证资料覆盖的示例问题（点一下会直接提问）：")
+                bcols = st.columns(len(_samples))
+                for col, it in zip(bcols, _samples):
+                    if col.button(it.question[:18] + ("…" if len(it.question) > 18 else ""),
+                                  key=f"ex_{it.item_id}", width="stretch"):
+                        st.session_state.pending_q = it.question
+                        st.rerun()
+            elif S.get("corpus_source") == KB_SOURCE:
+                st.info(
+                    "当前小米车型范围内没有与内置示例题一一对应的资料，因此不展示推荐问题。"
+                    "导入小米官方用户手册并标注车型后，系统才会显示可验证的推荐题。",
+                    icon="ℹ️",
+                )
+        except (IngestError, EvalError) as exc:
+            st.caption(f"示例问题暂不可用：{exc}")
     else:
         for m in history_msgs:
             render_turn(m)
