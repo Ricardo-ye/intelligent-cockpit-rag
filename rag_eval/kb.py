@@ -34,7 +34,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .config import DATA_DIR
 from .ingest import (
-    LOADERS, SUPPORTED_EXTENSIONS, Document, IngestError, corpus_hash, load_json_corpus,
+    LOADERS, SUPPORTED_EXTENSIONS, Document, IngestError, clean_retrieval_text, corpus_hash, load_json_corpus,
 )
 
 def default_kb_dir() -> Path:
@@ -53,6 +53,7 @@ MANIFEST_NAME = "manifest.json"
 MAX_DOC_CHARS = 300_000          # 单篇上限，防止超大网页把索引撑爆（超出部分截断并标注）
 
 _SLUG_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
+_QUALITY_NOISE_RE = re.compile(r"内容合作|商务合作|责任编辑|免责声明|联系我们|公众号|下载客户端|热门推荐|相关阅读")
 
 
 class KBError(RuntimeError):
@@ -100,6 +101,24 @@ def _clip(text: str) -> tuple:
     if len(text) <= MAX_DOC_CHARS:
         return text, False
     return text[:MAX_DOC_CHARS], True
+
+
+def assess_document_quality(text: str) -> Dict[str, Any]:
+    """给入库文本一个可解释的保守质量提示，不自动删除用户文档。"""
+    raw = (text or "").strip()
+    clean = clean_retrieval_text(raw)
+    warnings: List[str] = []
+    if len(clean) < 80:
+        warnings.append("正文过短")
+    if _QUALITY_NOISE_RE.search(raw):
+        warnings.append("含网页页脚或推荐位残留")
+    if raw and len(clean) / len(raw) < 0.75:
+        warnings.append("清洗前含较多结构噪声")
+    # 问答聚合页通常混有大量无关标题；只提示人工复核，避免误删有效 FAQ。
+    if len(re.findall(r"[？?]", clean)) >= 8:
+        warnings.append("疑似多主题问答聚合页")
+    score = max(0.0, round(1.0 - 0.18 * len(warnings), 2))
+    return {"score": score, "warnings": warnings, "clean_chars": len(clean)}
 
 
 @dataclass
@@ -217,6 +236,7 @@ class KnowledgeBase:
             "root": str(self.root),
             "n_truncated": sum(1 for e in entries if e.get("truncated")),
             "n_versions": sum(int(e.get("version", 1)) - 1 for e in entries),
+            "n_quality_warnings": sum(1 for e in entries if (e.get("quality") or {}).get("warnings")),
         }
 
     def fingerprint(self) -> str:
@@ -235,13 +255,31 @@ class KnowledgeBase:
                 "版本": e.get("version", 1),
                 "来源": (e.get("source") or "")[:80],
                 "更新时间": e.get("updated_at", ""),
+                "质量提示": "；".join((e.get("quality") or {}).get("warnings", [])) or "—",
             })
         return rows[:limit] if limit else rows
 
+    def audit_quality(self, include_clean: bool = False) -> List[dict]:
+        """审计现有文档质量；仅报告，不会自动移除任何用户数据。"""
+        rows: List[dict] = []
+        for entry in self._load()["entries"]:
+            doc = self.get(entry["doc_id"])
+            if doc is None:
+                continue
+            quality = assess_document_quality(doc.text)
+            if include_clean or quality["warnings"]:
+                rows.append({
+                    "doc_id": doc.doc_id, "title": doc.title, "source": doc.source,
+                    **quality,
+                })
+        return rows
+
     # ── 写 ────────────────────────────────────
     def _write_doc(self, doc: Document, source_type: str, tags: Sequence[str],
-                   version: int, created_at: str) -> dict:
+                    version: int, created_at: str,
+                    quality: Optional[Dict[str, Any]] = None) -> dict:
         text, truncated = _clip(doc.text)
+        quality = quality or assess_document_quality(text)
         chash = _short_hash(text, 16)
         fname = _safe_filename(doc.doc_id)
         _atomic_write_text(
@@ -254,6 +292,7 @@ class KnowledgeBase:
             "source": doc.source, "source_type": source_type,
             "tags": list(tags), "chars": len(text), "content_hash": chash,
             "truncated": truncated, "version": version,
+            "quality": quality,
             "added_at": created_at, "updated_at": _now(),
         }
 
@@ -267,10 +306,16 @@ class KnowledgeBase:
         seen_hashes = {e.get("content_hash") for e in entries}
 
         for doc in docs:
-            if not (doc.text or "").strip():
+            raw_quality = assess_document_quality(doc.text)
+            cleaned = clean_retrieval_text(doc.text)
+            if not cleaned:
                 res.skipped += 1
                 res.messages.append(f"跳过空文档：{doc.doc_id}")
                 continue
+
+            # 持久化清洗后的副本。原始来源 URL/文件名仍在 metadata 中，可回溯；
+            # 这里只去除确定的网页模板噪声，不改变可用的业务段落。
+            doc = Document(doc_id=doc.doc_id, title=doc.title, text=cleaned, source=doc.source)
 
             text, truncated = _clip(doc.text)
             chash = _short_hash(text, 16)
@@ -289,7 +334,9 @@ class KnowledgeBase:
 
             version = int(old.get("version", 1)) + 1 if old else 1
             created = old.get("added_at") if old else _now()
-            entry = self._write_doc(doc, source_type, tags or [], version, created or _now())
+            entry = self._write_doc(
+                doc, source_type, tags or [], version, created or _now(), quality=raw_quality,
+            )
 
             if old is not None:
                 if old.get("file") and old["file"] != entry["file"]:
@@ -304,6 +351,9 @@ class KnowledgeBase:
 
             if truncated:
                 res.messages.append(f"⚠ 正文超过 {MAX_DOC_CHARS} 字已截断：{doc.title[:40]}")
+            quality = entry.get("quality") or {}
+            if quality.get("warnings"):
+                res.messages.append(f"⚠ 建议复核资料质量：{doc.title[:40]}（{'；'.join(quality['warnings'])}）")
             by_id[doc.doc_id] = entry
             seen_hashes.add(chash)
             res.docs.append({"doc_id": doc.doc_id, "title": doc.title,
@@ -450,3 +500,4 @@ __all__ = [
     "KnowledgeBase", "KBError", "ImportResult", "KB_DIR", "KB_DOCS_DIR",
     "default_kb_dir", "SUPPORTED_EXTENSIONS", "MAX_DOC_CHARS",
 ]
+
