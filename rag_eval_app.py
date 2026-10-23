@@ -579,6 +579,8 @@ def make_cfg(S: dict) -> RunConfig:
         top_k=int(S["top_k"]),
         use_hybrid=bool(S["use_hybrid"]),
         bm25_weight=float(S["bm25_weight"]),
+        min_query_coverage=float(S.get("min_query_coverage", 0.12)),
+        max_chunks_per_doc=int(S.get("max_chunks_per_doc", 2)),
         rerank_backend=S["rerank_backend"],
         rerank_top_k=int(S["rerank_top_k"]),
         use_compression=bool(S["use_compression"]),
@@ -826,6 +828,14 @@ def render_config_panel() -> dict:
             else:
                 bm25_weight = 0.0
                 st.caption("仅使用向量检索")
+            min_query_coverage = st.slider(
+                "问题支撑下限", 0.0, 0.50, 0.12, 0.01,
+                help="候选需覆盖的问题关键信号比例；低于下限不进入回答，减少答非所问。设为 0 可关闭。",
+            )
+            max_chunks_per_doc = st.number_input(
+                "单文档最多上下文块", 1, 10, 2,
+                help="避免一篇长网页占满上下文，默认保留更多来源以便互证。",
+            )
         with rc3:
             st.markdown("**上下文压缩与缓存**")
             use_compression = st.toggle(
@@ -845,6 +855,7 @@ def render_config_panel() -> dict:
                 chunk_size=chunk_size, chunk_overlap=chunk_overlap, embed_backend=embed_backend,
                 embed_dim=embed_dim, embed_api_model=embed_api_model, top_k=top_k,
                 use_hybrid=use_hybrid, bm25_weight=bm25_weight, rerank_backend=rerank_backend,
+                min_query_coverage=min_query_coverage, max_chunks_per_doc=max_chunks_per_doc,
                 rerank_top_k=rerank_top_k, use_compression=use_compression, llm_backend=llm_backend,
                 llm_model=llm_model, llm_temperature=llm_temperature, llm_max_tokens=llm_max_tokens,
                 use_llm_judge=use_llm_judge, use_cache=use_cache,
@@ -867,6 +878,7 @@ def render_config_panel() -> dict:
         "embed_backend": embed_backend, "embed_dim": embed_dim,
         "embed_api_model": embed_api_model, "top_k": top_k,
         "use_hybrid": use_hybrid, "bm25_weight": bm25_weight,
+        "min_query_coverage": min_query_coverage, "max_chunks_per_doc": max_chunks_per_doc,
         "rerank_backend": rerank_backend, "rerank_top_k": rerank_top_k,
         "use_compression": use_compression, "llm_backend": llm_backend,
         "llm_model": llm_model, "llm_temperature": llm_temperature,
@@ -892,6 +904,11 @@ def _kb_metric_row() -> dict:
     m5.metric("最后更新", (stt["updated_at"] or "—")[5:16])
     if stt["by_type"]:
         st.caption("类型分布：" + "　".join(f"`{k}` {v} 篇" for k, v in stt["by_type"].items()))
+    if stt.get("n_quality_warnings"):
+        st.warning(
+            f"已有 {stt['n_quality_warnings']} 篇新导入资料带质量提示；建议执行下方“资料质量审计”后复核来源。",
+            icon="⚠️",
+        )
     return stt
 
 
@@ -946,8 +963,20 @@ def render_kb_panel() -> None:
         if st.button("🧹 清空知识库", width="stretch", disabled=_KB.is_empty()):
             st.session_state.kb_confirm_clear = True
     with tb4:
+        if st.button("🔎 资料质量审计", width="stretch", disabled=_KB.is_empty(),
+                     help="仅检查并报告网页噪声、过短文本和疑似多主题聚合页；不会删除任何资料"):
+            st.session_state["kb_quality_audit"] = _KB.audit_quality(include_clean=False)
         if st.session_state.get("kb_export_path"):
             st.caption(f"最近导出：`{Path(st.session_state['kb_export_path']).name}`")
+
+    audit = st.session_state.get("kb_quality_audit")
+    if audit is not None:
+        with st.expander(f"资料质量审计结果（发现 {len(audit)} 篇待复核）", expanded=bool(audit)):
+            if audit:
+                st.dataframe(pd.DataFrame(audit), width="stretch", hide_index=True)
+                st.caption("审计只提示风险：请优先保留车型手册、官方 FAQ 等一手资料；删除操作仍需由你在文档清单中明确执行。")
+            else:
+                st.success("未发现显著网页噪声或多主题聚合页提示。")
 
     if st.session_state.get("kb_confirm_clear"):
         st.warning("⚠️ 清空会删除知识库内全部文档（磁盘文件一并删除），且不可撤销。"
@@ -1188,7 +1217,8 @@ def _source_card(rc: dict, show_scores: bool) -> str:
     meta = f"#{rc['rank']} · {html.escape(str(rc['doc_title']), quote=True)}"
     if show_scores:
         meta += (f" · score={rc['score']} · vec={rc['vector_score']} "
-                 f"· bm25={rc['bm25_score']} · rerank={rc['rerank_score']}")
+                 f"· bm25={rc['bm25_score']} · rerank={rc['rerank_score']}"
+                 f" · support={rc.get('query_coverage')}")
     meta += f" · doc_id={html.escape(str(rc['doc_id']), quote=True)}"
     return (f'<div class="bubble-src"><div class="h">{meta}</div>'
             f'<div>{html.escape(str(rc["text"]), quote=True)}</div></div>')
@@ -1270,6 +1300,7 @@ def _answer(question: str, S: dict, history: Optional[list] = None) -> dict:
         gen = ev.generator.generate(
             question, retrieved, history=history,
             max_history_turns=int(st.session_state.ui_history_turns),
+            retrieval_query=search_q,
         )
         t_gen = (time.perf_counter() - t0) * 1000
 
@@ -1717,3 +1748,4 @@ font-family:'JetBrains Mono',monospace;border-top:1px solid {THEME['border']};ma
     智能座舱 RAG 工作台 v2.4 · 真实流水线：语料解析 → 分块 → 向量化 → FAISS+BM25 → 混合检索 → 重排 → 生成 → 指标
 </div>
 """, unsafe_allow_html=True)
+
