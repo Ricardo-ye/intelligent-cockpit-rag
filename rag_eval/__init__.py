@@ -37,7 +37,7 @@ from .webimport import (
     fetch_url, is_direct_url, search_and_fetch, web_search,
 )
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 __all__ = [
     "__version__",
@@ -60,3 +60,4 @@ __all__ = [
     "fetch_url", "web_search", "search_and_fetch", "is_direct_url", "ENGINE_CHAIN",
     "SecurityError", "resolve_upload_path", "safe_upload_filename", "validate_public_http_url",
 ]
+
